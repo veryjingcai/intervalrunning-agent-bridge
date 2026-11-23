@@ -1,4 +1,8 @@
-# intervalrunning 智能体桥接服务
+<div align="center">
+  <img src="assets/app-icon.png" width="128" alt="间歇跑 App 图标">
+  <h1>间歇跑</h1>
+  <p>intervalrunning 智能体桥接服务</p>
+</div>
 
 让手机 App 和智能体（WorkBuddy、豆包等）互相说话：智能体可以读取你的训练记录和课表，也可以写入训练计划，手机会自动同步。
 
