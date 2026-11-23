@@ -67,7 +67,7 @@ python bridge.py serve
 
 左侧「技能 · 连接器 · 伙伴」→「+ 添加 / 新建」→「新建自定义连接器」。未登录时侧边栏被精简，先登录再找入口。按图填写：
 
-![豆包自定义连接器配置：服务器名 intervalrunning，传输类型 STDIO，命令为本机 Python 绝对路径，参数为 bridge.py 与 mcp，环境变量 PYTHONUTF8=1、PYTHONIOENCODING=utf-8](README.assets/doubao-mcp-connector.jpg)
+![豆包自定义连接器配置：服务器名 intervalrunning，传输类型 STDIO，命令为本机 Python 绝对路径，参数为 bridge.py 与 mcp，环境变量 PYTHONUTF8=1、PYTHONIOENCODING=utf-8](assets/doubao-mcp-connector.jpg)
 
 | 字段 | 填什么 |
 |---|---|
