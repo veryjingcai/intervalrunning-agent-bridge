@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<!--
+  智能体连接器配置教程（通用演示页）。
+  两种方式严格分开：① MCP 文件配置（代表 WorkBuddy 这类智能体软件）② 输入式配置（代表豆包工作客户端）。
+  所有数据与界面均为本地模拟，不发起网络请求、不收集凭据、不保存任何输入。
+  主题色取自 App 的 RunOrange #F25C42（app/.../ui/theme/Color.kt）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>智能体连接器配置教程</title>
+<style>
+  :root{
+    /* 与 App 一致的主题橙 */
+    --brand:#f25c42;
+    --brand-2:#d8452e;
+    --brand-soft:#fef0ec;
+    --brand-line:#f9d5cd;
+    --brand-shadow:rgba(242,92,66,.30);
+    --brand-ring:rgba(242,92,66,.16);
+    --ink:#171a1f;
+    --ink-2:#3c424c;
+    --muted:#8b939e;
+    --line:#e7ebef;
+    --bg:#f7f8fa;
+    --card:#fff;
+    --danger:#e5484d;
+    --r-lg:18px;
+    --r-md:12px;
+    --r-sm:8px;
+    --sh:0 12px 40px rgba(60,28,20,.08),0 2px 8px rgba(60,28,20,.04);
+    --font:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:var(--font);color:var(--ink);background:
+      radial-gradient(900px 480px at 12% -8%,rgba(242,92,66,.11),transparent 62%),
+      radial-gradient(760px 420px at 92% 4%,rgba(242,92,66,.08),transparent 60%),
+      var(--bg);
+    -webkit-font-smoothing:antialiased;line-height:1.6;
+  }
+  .page{max-width:1180px;margin:0 auto;padding:26px 24px 48px}
+
+  /* ---------- top ---------- */
+  .top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:30px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.2px}
+  .brand-mark{width:36px;height:36px;border-radius:10px;background:var(--brand);display:grid;place-items:center;box-shadow:0 4px 12px var(--brand-shadow)}
+  .brand-mark svg{width:20px;height:20px}
+  .brand span{font-size:16px}
+  .brand small{display:block;font-size:9px;letter-spacing:1.4px;color:var(--muted);font-weight:700;line-height:1}
+  .top-badge{font-size:12px;color:var(--brand-2);background:var(--brand-soft);border:1px solid var(--brand-line);border-radius:999px;padding:6px 13px;font-weight:600}
+
+  /* ---------- intro ---------- */
+  .intro{margin-bottom:22px}
+  .eyebrow{font-size:11px;font-weight:800;letter-spacing:2.4px;color:var(--brand-2);margin-bottom:10px}
+  .intro h1{font-size:clamp(27px,4vw,40px);line-height:1.2;margin:0 0 10px;letter-spacing:-1px;font-weight:800}
+  .intro h1 em{font-style:normal;color:var(--brand)}
+  .intro p{margin:0;color:var(--muted);font-size:13.5px;max-width:760px}
+  .intro p b{color:var(--ink-2)}
+
+  /* ---------- 两种方式的切换 ---------- */
+  .modes{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:24px 0 8px}
+  .mode{display:flex;align-items:center;gap:12px;text-align:left;font-family:inherit;cursor:pointer;
+    background:#fff;border:1px solid var(--line);border-radius:14px;padding:13px 15px;transition:.22s;color:var(--ink)}
+  .mode:hover{border-color:var(--brand-line);transform:translateY(-1px)}
+  .mode .mi{flex:0 0 34px;width:34px;height:34px;border-radius:9px;background:#f2f4f6;color:var(--muted);
+    display:grid;place-items:center;font-size:12px;font-weight:900;transition:.22s}
+  .mode b{display:block;font-size:13.5px}
+  .mode small{display:block;font-size:11px;color:var(--muted);margin-top:2px}
+  .mode.on{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-ring)}
+  .mode.on .mi{background:var(--brand);color:#fff}
+  .mode.on small{color:var(--brand-2)}
+  .mode:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+
+  /* ---------- progress ---------- */
+  .progress{display:grid;grid-template-columns:repeat(4,1fr);position:relative;margin:24px 0 20px}
+  .progress::before{content:"";position:absolute;left:8%;right:8%;top:17px;height:2px;background:var(--line);z-index:0}
+  .progress-fill{position:absolute;left:8%;top:17px;height:2px;background:var(--brand);z-index:1;transition:width .5s ease;width:0}
+  .pstep{position:relative;z-index:2;background:none;border:0;font-family:inherit;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:8px;padding:0;color:var(--muted)}
+  .pnum{width:36px;height:36px;border-radius:50%;background:#fff;border:2px solid var(--line);display:grid;place-items:center;font-size:13px;font-weight:800;transition:.3s}
+  .plabel{font-size:12px;font-weight:600;transition:.3s}
+  .pstep.done .pnum{background:var(--brand);border-color:var(--brand);color:#fff}
+  .pstep.done .plabel{color:var(--ink-2)}
+  .pstep.on .pnum{background:#fff;border-color:var(--brand);color:var(--brand);box-shadow:0 0 0 5px var(--brand-ring)}
+  .pstep.on .plabel{color:var(--brand-2);font-weight:800}
+  .pstep:focus-visible{outline:2px solid var(--brand);outline-offset:4px;border-radius:8px}
+
+  /* ---------- stage ---------- */
+  .stage{display:grid;grid-template-columns:minmax(0,1.75fr) minmax(260px,.85fr);gap:22px;align-items:stretch}
+  .win{background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--sh);overflow:hidden;display:flex;flex-direction:column;min-height:570px}
+  .win-bar{height:46px;flex:0 0 46px;display:flex;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line);background:#fcfdfd}
+  .dots{display:flex;gap:6px}
+  .dots i{width:9px;height:9px;border-radius:50%;background:#e2e6ea;display:block}
+  .dots i:nth-child(1){background:#ffc9bd}.dots i:nth-child(2){background:#ffe0cf}.dots i:nth-child(3){background:#f7d9d2}
+  .win-title{font-size:12px;font-weight:700;color:var(--ink-2);margin-left:4px}
+  .win-bar-right{margin-left:auto;font-size:11px;color:var(--muted)}
+  .win-body{display:flex;flex:1;min-height:0}
+  .side{width:172px;flex:0 0 172px;background:#fafbfc;border-right:1px solid var(--line);padding:14px 10px;opacity:.62}
+  .side-cap{font-size:10px;color:#aeb5bf;font-weight:700;letter-spacing:1px;padding:0 10px 8px}
+  .side-item{display:flex;align-items:center;gap:9px;font-size:12px;color:#7b838f;padding:9px 10px;border-radius:8px;margin-bottom:3px}
+  .side-item.hot{color:var(--brand-2);background:var(--brand-soft);font-weight:700;opacity:0;transform:translateY(4px);transition:.45s}
+  .side-item.hot.show{opacity:1;transform:none}
+  .side-note{margin:14px 10px 0;font-size:10px;color:#b9c0c9;line-height:1.5}
+  .screen{flex:1;min-width:0;padding:22px 24px;position:relative;overflow:hidden}
+  .s-head h3{margin:0 0 4px;font-size:18px;letter-spacing:-.3px}
+  .s-head p{margin:0 0 18px;font-size:12px;color:var(--muted)}
+
+  /* 路径 / 文件高亮（方式一） */
+  .pathbox{display:flex;align-items:center;gap:12px;border:1px solid var(--line);border-radius:12px;padding:15px 16px;transition:.3s;background:#fff}
+  .pathbox.active{border-color:var(--brand);background:var(--brand-soft);box-shadow:0 0 0 4px var(--brand-ring)}
+  .path-ico{width:38px;height:38px;flex:0 0 38px;border-radius:9px;background:#f2f4f6;display:grid;place-items:center;font-size:17px}
+  .pathbox.active .path-ico{background:var(--brand);color:#fff}
+  .pathbox code{font-size:12px;font-family:ui-monospace,Consolas,monospace;color:var(--ink);word-break:break-all}
+  .pathbox small{display:block;font-size:11px;color:var(--muted);margin-top:3px}
+  .path-tag{margin-left:auto;flex:0 0 auto;font-size:10px;font-weight:800;color:var(--brand-2);background:#fff;border:1px solid var(--brand-line);border-radius:999px;padding:3px 9px}
+  .float-tip{position:absolute;right:24px;top:184px;background:var(--ink);color:#fff;font-size:12px;padding:9px 13px;border-radius:9px;opacity:0;transform:translateY(8px);transition:.4s;pointer-events:none;box-shadow:0 8px 20px rgba(0,0,0,.18)}
+  .float-tip.show{opacity:1;transform:none}
+  .float-tip::after{content:"";position:absolute;left:-5px;top:14px;width:10px;height:10px;background:var(--ink);transform:rotate(45deg)}
+
+  /* JSON 代码（方式一） */
+  .code{margin:0;background:#1f232a;color:#ffd9cf;border-radius:12px;padding:16px 18px;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;line-height:1.85;overflow:auto}
+  .code .cline{display:block;opacity:0;transform:translateX(-6px);transition:.3s}
+  .code .cline.show{opacity:1;transform:none}
+  .code .k{color:#ff9d86}.code .s{color:#ffd08a}.code .p{color:#8b98a8}
+  .codenote{font-size:11px;color:var(--muted);margin-top:12px;padding:9px 12px;background:#f7f9fa;border:1px dashed var(--line);border-radius:8px}
+
+  /* 通用状态区 */
+  .conn{text-align:center;padding:8px 0 2px}
+  .conn-ring{width:74px;height:74px;border-radius:50%;margin:0 auto 14px;display:grid;place-items:center;background:var(--brand-soft);color:var(--brand);position:relative}
+  .conn-ring svg{width:34px;height:34px}
+  .conn h3{margin:0 0 4px;font-size:17px}
+  .conn p{margin:0 0 18px;font-size:12px;color:var(--muted)}
+  .checklist{max-width:420px;margin:0 auto;text-align:left}
+  .check{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--ink-2);padding:8px 10px;border-radius:8px;opacity:0;transform:translateX(-8px);transition:.35s}
+  .check.show{opacity:1;transform:none}
+  .check i{flex:0 0 18px;width:18px;height:18px;border-radius:50%;background:var(--brand-soft);color:var(--brand);display:grid;place-items:center;font-size:11px;font-style:normal;font-weight:900}
+  .tipbox{max-width:420px;margin:16px auto 0;font-size:11px;color:var(--muted);background:#f7f9fa;border:1px dashed var(--line);border-radius:8px;padding:9px 12px}
+
+  /* 豆包入口菜单（方式二） */
+  .menu{border:1px solid var(--line);border-radius:12px;overflow:hidden;max-width:430px}
+  .menu-row{display:flex;align-items:center;justify-content:space-between;padding:12px 15px;font-size:13px;color:var(--ink-2);border-bottom:1px solid var(--line);transition:.3s}
+  .menu-row:last-child{border-bottom:0}
+  .menu-row span{color:#c4cad2}
+  .menu-row.hot{background:var(--brand-soft);color:var(--brand-2);font-weight:700}
+  .menu-row.sub{padding-left:34px;font-size:12px;color:var(--muted)}
+  .menu-row.new{opacity:0;transform:translateY(-5px);background:var(--brand);color:#fff;font-weight:800;border-radius:8px;margin:8px;padding:11px 15px;border:0;box-shadow:0 4px 12px var(--brand-shadow)}
+  .menu-row.new.show{opacity:1;transform:none}
+
+  /* 表单（方式二） */
+  .modal{max-width:470px;margin:0 auto;background:#fff;border:1px solid var(--line);border-radius:14px;box-shadow:0 10px 30px rgba(20,40,32,.06);overflow:hidden}
+  .modal-head{padding:14px 18px;border-bottom:1px solid var(--line)}
+  .modal-head h3{margin:0;font-size:15px}
+  .modal-head p{margin:3px 0 0;font-size:11px;color:var(--muted)}
+  .modal-body{padding:16px 18px 4px}
+  .field{display:grid;grid-template-columns:76px 1fr;align-items:center;gap:8px;margin-bottom:12px}
+  .field label{font-size:12px;color:var(--ink-2);font-weight:600}
+  .field input{width:100%;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;color:var(--ink);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px;background:#fbfcfd;outline:none;transition:.2s}
+  .field input:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-ring)}
+  .seg{display:flex;gap:6px}
+  .seg span{font-size:11px;font-weight:700;padding:6px 12px;border-radius:6px;background:#f2f4f6;color:var(--muted)}
+  .seg span.on{background:var(--brand-soft);color:var(--brand-2);box-shadow:inset 0 0 0 1px var(--brand-line)}
+  .multi{display:grid;gap:6px}
+  .multi .pair{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .plus{font-size:10.5px;color:var(--muted);background:#f7f9fa;border:1px dashed var(--line);border-radius:6px;padding:4px 9px;justify-self:start}
+  .verify-line{font-size:11.5px;color:var(--brand-2);background:var(--brand-soft);border-radius:8px;padding:8px 11px;margin:2px 0 10px;opacity:0;transform:translateY(5px);transition:.35s}
+  .verify-line.show{opacity:1;transform:none}
+  .modal-foot{display:flex;justify-content:flex-end;padding:10px 18px 16px}
+  .btn{font-family:inherit;font-size:12px;font-weight:700;border-radius:8px;padding:9px 18px;cursor:pointer;border:1px solid var(--line);background:#fff;color:var(--ink-2);transition:.18s}
+  .btn.brand{background:var(--brand);border-color:var(--brand);color:#fff}
+  .btn.brand:hover{background:var(--brand-2)}
+  .btn:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+
+  /* 效果演示（共用） */
+  .chat{display:flex;flex-direction:column;gap:14px}
+  .bubble{max-width:88%;font-size:12.5px;padding:11px 14px;border-radius:12px;line-height:1.65;opacity:0;transform:translateY(8px);transition:.4s}
+  .bubble.show{opacity:1;transform:none}
+  .bubble.user{align-self:flex-end;background:var(--ink);color:#fff;border-bottom-right-radius:3px}
+  .bubble.ai{align-self:flex-start;background:#f6f8f9;border:1px solid var(--line);border-bottom-left-radius:3px}
+  .acts{display:flex;flex-direction:column;gap:7px;max-width:92%;opacity:0;transition:.4s}
+  .acts.show{opacity:1}
+  .act{display:flex;align-items:center;gap:9px;font-size:11.5px;color:var(--ink-2);background:#fff;border:1px solid var(--line);border-radius:8px;padding:8px 11px;opacity:0;transform:translateX(-6px);transition:.35s}
+  .act.show{opacity:1;transform:none}
+  .act code{font-family:ui-monospace,Consolas,monospace;font-size:10.5px;color:var(--brand-2);background:var(--brand-soft);padding:2px 6px;border-radius:5px}
+  .act .ok{margin-left:auto;color:var(--brand);font-weight:800;font-size:11px}
+  .plancard{border:1px solid var(--brand-line);background:var(--brand-soft);border-radius:12px;padding:13px 15px;opacity:0;transform:translateY(8px);transition:.45s}
+  .plancard.show{opacity:1;transform:none}
+  .plancard .t{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:800;color:var(--ink)}
+  .plancard .tag{font-size:10px;background:var(--brand);color:#fff;border-radius:999px;padding:2px 9px;font-weight:700}
+  .plancard ul{margin:9px 0 0;padding:0;list-style:none;display:grid;gap:5px}
+  .plancard li{font-size:11.5px;color:var(--ink-2);display:flex;justify-content:space-between;border-top:1px dashed var(--brand-line);padding-top:5px}
+  .plancard li b{color:var(--brand-2)}
+
+  /* ---------- 说明栏 ---------- */
+  .story{background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--sh);padding:22px;display:flex;flex-direction:column;min-height:570px}
+  .story-tag{display:inline-flex;align-self:flex-start;font-size:10.5px;font-weight:800;letter-spacing:.6px;color:var(--brand-2);background:var(--brand-soft);border-radius:999px;padding:5px 11px;margin-bottom:16px}
+  .story h2{font-size:20px;margin:0 0 10px;letter-spacing:-.5px;line-height:1.35}
+  .story .lead{font-size:12.5px;color:var(--muted);margin:0 0 20px}
+  .story .pts{list-style:none;padding:0;margin:0;display:grid;gap:12px}
+  .story .pts li{display:flex;gap:10px;font-size:12.5px;color:var(--ink-2);line-height:1.6}
+  .story .pts i{flex:0 0 20px;width:20px;height:20px;border-radius:6px;background:var(--brand-soft);color:var(--brand-2);font-style:normal;font-weight:900;font-size:11px;display:grid;place-items:center;margin-top:1px}
+  .story .pts b{color:var(--ink)}
+  .story .note{margin-top:auto;padding-top:18px}
+  .story .note-box{background:#f7f9fa;border:1px dashed var(--line);border-radius:10px;padding:11px 13px;font-size:11.5px;color:#6f7885;line-height:1.65}
+  .story .note-box b{color:var(--ink-2)}
+  .story-enter{animation:fadeUp .4s ease both}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(9px)}to{opacity:1;transform:none}}
+
+  /* ---------- controls ---------- */
+  .controls{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:22px;flex-wrap:wrap}
+  .ctrl-left{display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  .step-count{font-size:12px;color:var(--muted);margin-right:6px}
+  .btn.ghost{border-color:transparent;background:transparent}
+  .auto-state{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .auto-state i{width:7px;height:7px;border-radius:50%;background:#cdd3da;display:block}
+  .auto-state.on i{background:var(--brand);box-shadow:0 0 0 3px var(--brand-ring)}
+  .foot-hint{font-size:11px;color:#a2aab4;margin-top:16px;text-align:center}
+
+  @media(max-width:960px){
+    .stage{grid-template-columns:1fr}
+    .story{min-height:auto;order:-1}
+    .win{min-height:530px}
+  }
+  @media(max-width:560px){
+    .page{padding:18px 14px 36px}
+    .modes{grid-template-columns:1fr}
+    .plabel{font-size:10px}
+    .side{display:none}
+    .screen{padding:18px 16px}
+    .float-tip{right:16px;top:180px}
+  }
+  @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="top">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M9 15l6-6M8 7.5 6.5 9a3.5 3.5 0 0 0 5 5L13 13.5M16 16.5l1.5-1.5a3.5 3.5 0 0 0-5-5L11 10.5" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div><span>智能体连接器配置</span><small>AGENT CONNECTOR GUIDE</small></div>
+    </div>
+    <div class="top-badge">通用教程 · 两种接入方式</div>
+  </header>
+
+  <section class="intro">
+    <div class="eyebrow">CONNECTOR SETUP GUIDE</div>
+    <h1>智能体连接器配置教程</h1>
+    <p>一份<b>智能体通用配置教程</b>。不同智能体的接入方式并不相同：下面介绍两种典型方式——<b>在 MCP 文件中配置</b>（代表：WorkBuddy 这类智能体软件），以及<b>输入式配置连接器</b>（代表：豆包工作客户端）。请按你使用的客户端选择对应方式，两者不要混用。</p>
+  </section>
+
+  <div class="modes" role="tablist" aria-label="配置方式">
+    <button class="mode on" data-mode="mcp" role="tab" aria-selected="true">
+      <span class="mi">01</span>
+      <div><b>方式一 · MCP 文件配置</b><small>代表：WorkBuddy 这类智能体软件 · 在 MCP 文件中配置</small></div>
+    </button>
+    <button class="mode" data-mode="input" role="tab" aria-selected="false">
+      <span class="mi">02</span>
+      <div><b>方式二 · 输入式配置连接器</b><small>代表：豆包工作客户端 · 在界面里逐项填写</small></div>
+    </button>
+  </div>
+
+  <nav class="progress" aria-label="配置步骤">
+    <div class="progress-fill" id="pfill"></div>
+    <button class="pstep on" data-go="1" aria-current="step"><span class="pnum">1</span><span class="plabel">找到入口</span></button>
+    <button class="pstep" data-go="2"><span class="pnum">2</span><span class="plabel">填写配置</span></button>
+    <button class="pstep" data-go="3"><span class="pnum">3</span><span class="plabel">保存生效</span></button>
+    <button class="pstep" data-go="4"><span class="pnum">4</span><span class="plabel">效果演示</span></button>
+  </nav>
+
+  <main class="stage">
+    <section class="win" aria-label="配置界面示意">
+      <div class="win-bar">
+        <span class="dots"><i></i><i></i><i></i></span>
+        <span class="win-title">智能体客户端 · 配置界面示意</span>
+        <span class="win-bar-right">示意界面 · 非重点区域已弱化</span>
+      </div>
+      <div class="win-body">
+        <div class="side" aria-hidden="true">
+          <div class="side-cap">工作区</div>
+          <div class="side-item">✦ &nbsp;新对话</div>
+          <div class="side-item">▤ &nbsp;资料库</div>
+          <div class="side-item">◷ &nbsp;定时任务</div>
+          <div class="side-item hot" id="sideHot">⌁ &nbsp;连接器</div>
+          <div class="side-item">◇ &nbsp;我的技能</div>
+          <div class="side-item">⚙ &nbsp;设置</div>
+          <div class="side-note">此处为弱化显示的导航，<br>不属于本次操作路径。</div>
+        </div>
+        <div class="screen" id="screen"></div>
+      </div>
+    </section>
+
+    <aside class="story" id="story" aria-live="polite"></aside>
+  </main>
+
+  <div class="controls">
+    <div class="ctrl-left">
+      <span class="step-count" id="count">第 1 / 4 步</span>
+      <button class="btn ghost" id="prev">← 上一步</button>
+      <button class="btn brand" id="next">下一步 →</button>
+      <button class="btn" id="replay">↻ 重播</button>
+    </div>
+    <div class="ctrl-left">
+      <span class="auto-state" id="autoState"><i></i><span>自动演示：关</span></span>
+      <button class="btn" id="autoBtn">▶ 自动演示</button>
+    </div>
+  </div>
+  <div class="foot-hint">本页为本地模拟教程，不包含真实密钥、账号或接口调用</div>
+</div>
+
+<!-- ============ 界面模板：方式一 MCP 文件配置 ============ -->
+<template id="tpl-mcp-1">
+  <div class="s-head"><h3>找到 MCP 配置文件</h3><p>WorkBuddy 这类智能体软件：连接器写在 MCP 配置文件里，不是在聊天窗口填表</p></div>
+  <div class="pathbox" id="pathbox">
+    <div class="path-ico">📄</div>
+    <div><code>C:\Users\&lt;用户名&gt;\.workbuddy\mcp.json</code><small>连接器配置写在这个 MCP 文件中</small></div>
+    <span class="path-tag">MCP 文件</span>
+  </div>
+  <div class="float-tip" id="tip">在 MCP 文件中配置 ↓</div>
+</template>
+
+<template id="tpl-mcp-2">
+  <div class="s-head"><h3>编辑 MCP 文件</h3><p>在 mcpServers 下增加一项，填入实际值与环境变量</p></div>
+  <pre class="code" id="code"><span class="cline">{
+<span class="cline">  <span class="k">"mcpServers"</span>: {
+<span class="cline">    <span class="k">"intervalrunning"</span>: {
+<span class="cline">      <span class="k">"command"</span>: <span class="s">"C:\\...\\python.exe"</span>,
+<span class="cline">      <span class="k">"args"</span>: [<span class="s">"D:\\...\\bridge.py"</span>, <span class="s">"mcp"</span>],
+<span class="cline">      <span class="k">"env"</span>: {
+<span class="cline">        <span class="k">"PYTHONUTF8"</span>: <span class="s">"1"</span>,
+<span class="cline">        <span class="k">"PYTHONIOENCODING"</span>: <span class="s">"utf-8"</span>
+<span class="cline">      }
+<span class="cline">    }
+<span class="cline">  }
+<span class="cline">}</pre>
+  <div class="codenote">command 用本机绝对路径；JSON 里反斜杠写两个（\\）；env 两行强制 UTF-8，避免中文乱码。</div>
+</template>
+
+<template id="tpl-mcp-3">
+  <div class="conn">
+    <div class="conn-ring"><svg viewBox="0 0 24 24" fill="none"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <h3>保存文件，然后重启客户端</h3>
+    <p>配置文件改动需要重启客户端才能加载</p>
+    <div class="checklist">
+      <div class="check" id="c1"><i>✓</i>把这一项写入 mcp.json 并保存</div>
+      <div class="check" id="c2"><i>✓</i>重启智能体客户端，让其重新读取配置</div>
+      <div class="check" id="c3"><i>✓</i>重启后连接器出现在可用工具中</div>
+    </div>
+  </div>
+</template>
+
+<!-- ============ 界面模板：方式二 输入式配置（豆包） ============ -->
+<template id="tpl-input-1">
+  <div class="s-head"><h3>豆包工作客户端 · 找到入口</h3><p>豆包不编辑 MCP 文件，走界面输入式配置</p></div>
+  <div class="menu">
+    <div class="menu-row">技能 · 连接器 · 伙伴 <span>›</span></div>
+    <div class="menu-row hot">← 左侧入口 <span>›</span></div>
+    <div class="menu-row sub">+ 添加 / 新建 <span>›</span></div>
+    <div class="menu-row new" id="newConn">新建自定义连接器</div>
+  </div>
+  <div class="float-tip" id="tip">在这里新建 ↓</div>
+</template>
+
+<template id="tpl-input-2">
+  <div class="modal">
+    <div class="modal-head"><h3>新建自定义连接器</h3><p>自定义连接器仅支持在本地电脑中使用</p></div>
+    <div class="modal-body">
+      <div class="field"><label>服务器名称</label><input id="fName" value="" readonly aria-label="服务器名称"></div>
+      <div class="field"><label>传输类型</label><div class="seg"><span class="on">STDIO</span><span>HTTP</span></div></div>
+      <div class="field"><label>命令</label><input id="fCmd" value="" readonly aria-label="命令"></div>
+      <div class="field"><label>参数</label><div class="multi"><input id="fP1" value="" readonly><input id="fP2" value="" readonly></div></div>
+      <div class="field"><label>环境变量</label><div class="multi">
+        <div class="pair"><input id="fEK1" value="" readonly><input id="fEV1" value="" readonly></div>
+        <div class="pair"><input id="fEK2" value="" readonly><input id="fEV2" value="" readonly></div>
+      </div></div>
+      <div class="verify-line" id="verify">✓ 字段填写完成，可保存</div>
+    </div>
+    <div class="modal-foot"><button class="btn brand" id="saveBtn">保存</button></div>
+  </div>
+</template>
+
+<template id="tpl-input-3">
+  <div class="conn">
+    <div class="conn-ring"><svg viewBox="0 0 24 24" fill="none"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+    <h3>已保存</h3>
+    <p>豆包工作客户端 · 自定义连接器</p>
+    <div class="checklist">
+      <div class="check" id="c1"><i>✓</i>点击「保存」，配置写入本机</div>
+      <div class="check" id="c2"><i>✓</i>首次提示“运行失败”属正常</div>
+      <div class="check" id="c3"><i>✓</i>到「我的技能 → 连接器」点一次「重新启动」</div>
+    </div>
+    <div class="tipbox">自定义连接器只在本机生效，不随账号同步到其他设备。</div>
+  </div>
+</template>
+
+<!-- ============ 共用：效果演示 ============ -->
+<template id="tpl-effect">
+  <div class="chat">
+    <div class="bubble user" id="b1">帮我安排下周的间歇跑计划，周三跑 800 米 × 6。</div>
+    <div class="bubble ai" id="b2">好的，我先校验训练参数，再写入并确认手机端是否收到。</div>
+    <div class="acts" id="acts">
+      <div class="act" id="a1"><code>validate_plan</code> 校验参数<span class="ok">✓ 通过</span></div>
+      <div class="act" id="a2"><code>set_plan</code> 写入计划<span class="ok">✓ 已写入</span></div>
+      <div class="act" id="a3"><code>wait_for_plan_result</code> 等待验收<span class="ok">✓ 已接收</span></div>
+    </div>
+    <div class="plancard" id="pc">
+      <div class="t">下周训练计划 <span class="tag">已同步至手机</span></div>
+      <ul>
+        <li><span>周一 · 轻松跑 5 km</span><b>按时间</b></li>
+        <li><span>周三 · 间歇 800 m × 6</span><b>按距离</b></li>
+        <li><span>周五 · 节奏跑 4 km</span><b>按时间</b></li>
+      </ul>
+    </div>
+  </div>
+</template>
+
+<script>
+(function(){
+  "use strict";
+  var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var screen = document.getElementById('screen');
+  var story  = document.getElementById('story');
+  var token=0, mode='mcp', step=1, auto=false, autoTimer=null;
+
+  var stories = {
+    mcp:[
+      {tag:'方式一 · MCP 文件配置 · 01',title:'先找到 MCP 配置文件',
+       lead:'WorkBuddy 这类智能体软件在 MCP 文件中配置连接器，不是在聊天窗口里填表。先找到那份文件。',
+       pts:['<b>位置：</b>用户目录下的 <b>mcp.json</b>，例如 <code>C:\\Users\\&lt;用户名&gt;\\.workbuddy\\mcp.json</code>。','<b>方式：</b>直接编辑这个 MCP 配置文件，把连接器写进 <b>mcpServers</b>。','<b>区别：</b>这是文件配置，不是豆包那种界面输入式流程，两者不要套用。'],
+       note:'本方式以 <b>WorkBuddy 这类智能体软件</b>为代表；核心是“在 MCP 文件中配置”。'},
+      {tag:'方式一 · MCP 文件配置 · 02',title:'在文件里填写配置项',
+       lead:'在 mcpServers 下增加一项，填入实际命令、参数和环境变量。',
+       pts:['<b>command：</b>本机 Python 绝对路径，GUI 启动子进程不继承 PATH。','<b>args：</b>桥脚本完整路径，再加一个 <b>mcp</b> 参数。','<b>env：</b>两行强制 UTF-8；JSON 里反斜杠要写两个（\\）。'],
+       note:'此处只有<b>文件编辑</b>，没有界面按钮；内容仅作示意，不会离开本页。'},
+      {tag:'方式一 · MCP 文件配置 · 03',title:'保存文件并重启客户端',
+       lead:'配置文件改动不会即时生效，需要重启客户端重新读取。',
+       pts:['<b>保存：</b>把这一项写入 mcp.json 并保存。','<b>重启：</b>重启智能体客户端，让它重新加载配置。','<b>验证：</b>重启后看工具是否出现在可用列表中。'],
+       note:'<b>不要套用豆包的“保存”界面流程</b>——WorkBuddy 是在 MCP 文件中配置。'},
+      {tag:'方式一 · MCP 文件配置 · 04',title:'配置成功后的效果',
+       lead:'重启后连接器被加载，智能体就能在提问中直接调用它。',
+       pts:['<b>提问触发：</b>用自然语言提出需求，不必记命令。','<b>过程可见：</b>先校验、再提交、再确认结果。','<b>结果落地：</b>产出可查看的卡片，而不是一句“已完成”。'],
+       note:'效果卡片为<b>示意内容</b>，真实效果取决于你接入的接口。'}
+    ],
+    input:[
+      {tag:'方式二 · 输入式配置 · 01',title:'找到豆包的连接器入口',
+       lead:'豆包工作客户端不编辑 MCP 文件，而是在界面里逐项填写。先进入入口。',
+       pts:['<b>入口：</b>左侧「技能 · 连接器 · 伙伴」→「+ 添加 / 新建」→「新建自定义连接器」。','<b>前提：</b>未登录时侧边栏会被精简，先登录再找入口。','<b>区别：</b>这是豆包工作客户端的流程，<b>不适用于 WorkBuddy</b>。'],
+       note:'本方式仅指<b>豆包工作客户端</b>；不要把这套界面流程套用到 WorkBuddy。'},
+      {tag:'方式二 · 输入式配置 · 02',title:'在界面里逐项填写',
+       lead:'按界面字段逐项填写；传输类型要从默认的 HTTP 改成 STDIO。',
+       pts:['<b>基础项：</b>服务器名称、传输类型（STDIO）。','<b>命令与参数：</b>命令填本机 Python 绝对路径，参数分两行。','<b>环境变量：</b>两行强制 UTF-8，避免中文乱码。'],
+       note:'字段与豆包真实界面一致；演示值仅作示意，不保存、不发送。'},
+      {tag:'方式二 · 输入式配置 · 03',title:'保存并按需重启',
+       lead:'豆包界面在填写完成后，只有一个「保存」按钮可使用。',
+       pts:['<b>保存：</b>点「保存」，配置写入本机。','<b>首次失败：</b>可能提示“连接器运行失败”，到「我的技能 → 连接器」点一次「重新启动」。','<b>范围：</b>自定义连接器只在本机生效，不随账号同步。'],
+       note:'本界面<b>仅呈现豆包真实存在的“保存”操作</b>，未添加任何客户端中没有的按钮或流程。'},
+      {tag:'方式二 · 输入式配置 · 04',title:'配置成功后的效果',
+       lead:'连接器保存并重启后，就能在提问中被调用。',
+       pts:['<b>提问触发：</b>用自然语言提出需求，不必记命令。','<b>过程可见：</b>先校验、再提交、再确认结果。','<b>结果落地：</b>产出可查看的卡片，而不是一句“已完成”。'],
+       note:'效果卡片为<b>示意内容</b>，真实效果取决于你接入的接口。'}
+    ]
+  };
+
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r,reduce?0:ms); }); }
+  function active(t){ return t===token; }
+  function $(id){ return document.getElementById(id); }
+  function clearAuto(){ if(autoTimer){clearTimeout(autoTimer);autoTimer=null;} }
+  function scheduleNext(ms){ clearAuto(); if(auto) autoTimer=setTimeout(function(){goto(step<4?step+1:1);},reduce?60:ms); }
+
+  function tpl(id){ return $(id).innerHTML; }
+  function mount(){
+    var id = step===4 ? 'tpl-effect' : 'tpl-'+mode+'-'+step;
+    screen.innerHTML = tpl(id);
+  }
+
+  function setProgress(n){
+    var ps=document.querySelectorAll('.pstep');
+    for(var i=0;i<ps.length;i++){
+      var k=i+1;
+      ps[i].className='pstep'+(k<n?' done':'')+(k===n?' on':'');
+      if(k===n) ps[i].setAttribute('aria-current','step'); else ps[i].removeAttribute('aria-current');
+    }
+    $('pfill').style.width=((n-1)/3*84)+'%';
+    $('count').textContent='第 '+n+' / 4 步';
+    $('next').textContent = n===4 ? '回到开头 →' : '下一步 →';
+  }
+
+  function renderStory(){
+    var s=stories[mode][step-1];
+    story.innerHTML='<div class="story-enter">'+
+      '<span class="story-tag">'+s.tag+'</span>'+
+      '<h2>'+s.title+'</h2>'+
+      '<p class="lead">'+s.lead+'</p>'+
+      '<ul class="pts">'+s.pts.map(function(p,i){return '<li><i>'+(i+1)+'</i><span>'+p+'</span></li>';}).join('')+'</ul>'+
+      '<div class="note"><div class="note-box"><b>说明 · </b>'+s.note+'</div></div>'+
+      '</div>';
+  }
+
+  function setMode(m){
+    mode=m;
+    var btns=document.querySelectorAll('.mode');
+    for(var i=0;i<btns.length;i++){
+      var on=btns[i].getAttribute('data-mode')===m;
+      btns[i].className='mode'+(on?' on':'');
+      btns[i].setAttribute('aria-selected',on?'true':'false');
+    }
+    goto(1);
+  }
+
+  /* ---- 各步动画 ---- */
+  async function mcp1(t){
+    mount(); $('sideHot').classList.remove('show');
+    await sleep(450); if(!active(t))return;
+    $('pathbox').classList.add('active'); $('sideHot').classList.add('show'); $('tip').classList.add('show');
+    scheduleNext(3400);
+  }
+  async function mcp2(t){
+    mount();
+    var cl=document.querySelectorAll('.code .cline');
+    await sleep(250); if(!active(t))return;
+    for(var i=0;i<cl.length;i++){ if(!active(t))return; cl[i].classList.add('show'); await sleep(115); }
+    scheduleNext(3000);
+  }
+  async function mcp3(t){
+    mount();
+    for(var i=1;i<=3;i++){ await sleep(600); if(!active(t))return; $('c'+i).classList.add('show'); }
+    scheduleNext(3200);
+  }
+  async function input1(t){
+    mount(); $('sideHot').classList.remove('show');
+    await sleep(450); if(!active(t))return;
+    $('sideHot').classList.add('show'); $('newConn').classList.add('show'); $('tip').classList.add('show');
+    scheduleNext(3400);
+  }
+  async function input2(t){
+    mount();
+    var vals={fName:'intervalrunning',fCmd:'C:\\...\\python.exe',fP1:'D:\\...\\bridge.py',fP2:'mcp',
+      fEK1:'PYTHONIOENCODING',fEV1:'utf-8',fEK2:'PYTHONUTF8',fEV2:'1'};
+    await sleep(300); if(!active(t))return;
+    for(var k in vals){
+      if(!active(t))return;
+      var el=$(k), txt=vals[k]; el.value='';
+      for(var i=0;i<txt.length;i++){ el.value+=txt.charAt(i); await sleep(reduce?0:14); }
+      await sleep(90);
+    }
+    $('verify').classList.add('show');
+    scheduleNext(3000);
+  }
+  async function input3(t){
+    mount();
+    for(var i=1;i<=3;i++){ await sleep(600); if(!active(t))return; $('c'+i).classList.add('show'); }
+    scheduleNext(3400);
+  }
+  async function effect(t){
+    mount();
+    await sleep(320); if(!active(t))return; $('b1').classList.add('show');
+    await sleep(680); if(!active(t))return; $('b2').classList.add('show');
+    await sleep(720); if(!active(t))return; $('acts').classList.add('show');
+    for(var i=1;i<=3;i++){ if(!active(t))return; $('a'+i).classList.add('show'); await sleep(560); }
+    $('pc').classList.add('show');
+    scheduleNext(6000);
+  }
+  var runs={
+    mcp:{1:mcp1,2:mcp2,3:mcp3,4:effect},
+    input:{1:input1,2:input2,3:input3,4:effect}
+  };
+
+  function goto(n){
+    token++; clearAuto(); step=n;
+    setProgress(n); renderStory();
+    runs[mode][n](token);
+  }
+
+  document.querySelectorAll('.mode').forEach(function(b){
+    b.addEventListener('click',function(){ setMode(b.getAttribute('data-mode')); });
+  });
+  document.querySelectorAll('.pstep').forEach(function(b){
+    b.addEventListener('click',function(){ goto(parseInt(b.getAttribute('data-go'),10)); });
+  });
+  $('next').addEventListener('click',function(){ goto(step===4?1:step+1); });
+  $('prev').addEventListener('click',function(){ goto(step===1?4:step-1); });
+  $('replay').addEventListener('click',function(){ goto(step); });
+  $('autoBtn').addEventListener('click',function(){
+    auto=!auto;
+    $('autoBtn').textContent=auto?'❚❚ 暂停演示':'▶ 自动演示';
+    $('autoState').className='auto-state'+(auto?' on':'');
+    $('autoState').querySelector('span').textContent='自动演示：'+(auto?'开':'关');
+    if(auto) scheduleNext(1800); else clearAuto();
+  });
+
+  // 模板内可点击元素（每次重建，用委托）
+  screen.addEventListener('click',function(e){
+    var id=e.target && e.target.id;
+    if(id==='pathbox'||id==='newConn') goto(2);
+    if(id==='saveBtn') goto(3);
+  });
+
+  setMode('mcp');
+})();
+</script>
+</body>
+</html>
