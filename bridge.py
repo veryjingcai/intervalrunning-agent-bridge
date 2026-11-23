@@ -24,6 +24,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -536,6 +537,8 @@ class Store:
             "plan": None, "revision": 0, "archives": [],
             # 谁最后写的、什么时候写的；手机上传不再能无声盖掉智能体计划
             "source": None, "writtenAt": 0, "phoneRevision": 0,
+            # 手机对当前版本的验收结果：智能体只有看到 APPLIED 才能判定任务完成
+            "acceptance": None,
         })
         if not isinstance(slot.get("archives"), list):
             slot["archives"] = []
@@ -560,6 +563,74 @@ class Store:
             self._load()
             slot = self.data["plans"].get(client_id or DEFAULT_CLIENT) or {}
             return int(slot.get("revision", 0) or 0)
+
+    def get_plan_acceptance(self, client_id):
+        """当前版本的验收结果；没有记录时返回 PENDING。"""
+        with self.lock:
+            self._load()
+            slot = self.data["plans"].get(client_id or DEFAULT_CLIENT) or {}
+            revision = int(slot.get("revision", 0) or 0)
+            acceptance = slot.get("acceptance")
+            if not isinstance(acceptance, dict):
+                return {"revision": revision, "status": "PENDING",
+                        "problems": [], "message": "等待手机验收", "reportedAt": 0}
+            return copy.deepcopy(acceptance)
+
+    def record_plan_acceptance(self, client_id, revision, status, problems=None,
+                               message=""):
+        """
+        记录手机对某个版本的验收结果。
+
+        版本必须与当前版本一致才更新「当前验收状态」；比当前版本旧的迟到回执只进历史，
+        不能把智能体刚写的新计划标成上一版的通过结果。
+        """
+        client_id = client_id or DEFAULT_CLIENT
+        status = str(status or "").upper()
+        if status not in ("APPLIED", "REJECTED"):
+            raise ValueError("status 必须是 APPLIED 或 REJECTED")
+        try:
+            revision = int(revision)
+        except (TypeError, ValueError):
+            raise ValueError("revision 必须是整数")
+        problems = [str(item) for item in (problems or [])]
+        with self.transaction() as data:
+            slot = self._plan_slot(data, client_id)
+            current = int(slot.get("revision", 0))
+            record = {
+                "revision": revision,
+                "status": status,
+                "problems": problems,
+                "message": str(message or ""),
+                "reportedAt": now_ms(),
+            }
+            stale = revision != current
+            history = slot.setdefault("acceptanceHistory", [])
+            if not isinstance(history, list):
+                history = []
+                slot["acceptanceHistory"] = history
+            history.append(copy.deepcopy(record))
+            # 留最近 20 条足够追溯：手机每轮同步都报一次的成功记录不该无限膨胀
+            if len(history) > 20:
+                del history[:-20]
+            if not stale:
+                slot["acceptance"] = record
+            return {"recorded": True, "stale": stale, "current": current,
+                    "status": slot.get("acceptance", {}).get("status", "PENDING")}
+
+    def device_last_seen(self, client_id):
+        """该设备最后一次与桥端通信的时间（毫秒）；没有记录返回 0。"""
+        client_id = client_id or DEFAULT_CLIENT
+        with self.lock:
+            self._load()
+            latest = 0
+            for pair in self.data.get("pairs", {}).values():
+                if client_id_of(pair) != client_id:
+                    continue
+                try:
+                    latest = max(latest, int(pair.get("lastSeen", 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+            return latest
 
     def set_plan(self, client_id, plan, bump_revision=True):
         """
@@ -589,6 +660,15 @@ class Store:
             # 不再直接调用这里，避免不升版本、无来源的静默覆盖。
             if bump_revision:
                 slot["revision"] = int(slot.get("revision", 0)) + 1
+            # 新版本必须重新等手机验收：上一版的 APPLIED 绝不能继承给新计划，
+            # 否则智能体会把「上一版已落盘」误判成「这一版已完成」。
+            slot["acceptance"] = {
+                "revision": int(slot.get("revision", 0)),
+                "status": "PENDING",
+                "problems": [],
+                "message": "已提交，等待手机验收",
+                "reportedAt": 0,
+            }
             # 智能体显式写某台设备时不能改「当前活跃设备」，否则一次临时写入
             # 会把后续省略 clientId 的调用带到错误的槽位。
             return archived
@@ -619,6 +699,19 @@ class Store:
             slot["source"] = "phone"
             slot["writtenAt"] = now_ms()
             slot["phoneRevision"] = int(slot.get("phoneRevision", 0)) + 1
+            # 手机用自己的计划覆盖了智能体刚提交的那一版：只有「还没验收」才改成
+            # PHONE_UPLOADED。已经 APPLIED/REJECTED 的最终结论必须保留——
+            # 手机落库后会把同一份计划回传上来，不能把刚拿到的验收结果又抹掉。
+            current_acceptance = slot.get("acceptance") or {}
+            if not isinstance(current_acceptance, dict) or \
+                    current_acceptance.get("status") in (None, "", "PENDING"):
+                slot["acceptance"] = {
+                    "revision": revision,
+                    "status": "PHONE_UPLOADED",
+                    "problems": [],
+                    "message": "手机已上传自己的计划，智能体提交的版本已被覆盖",
+                    "reportedAt": now_ms(),
+                }
             data["lastActiveClientId"] = client_id or data.get("lastActiveClientId", "")
             return {
                 "revision": revision,
@@ -998,6 +1091,8 @@ class NetServer:
                     return self._sessions(self._parse_body(raw))
                 if path == "/v1/plan":
                     return self._push_plan(self._parse_body(raw))
+                if path == "/v1/plan/result":
+                    return self._plan_result(self._parse_body(raw))
                 if path == "/v1/workouts":
                     return self._push_workouts(self._parse_body(raw))
                 return self._send(404, error_body("NOT_FOUND", "未知端点"))
@@ -1123,6 +1218,50 @@ class NetServer:
                     "clientId": owner,
                     "revision": uploaded["revision"],
                     "phoneRevision": uploaded["phoneRevision"],
+                })
+
+            def _plan_result(self, body):
+                # 手机上报验收结果：智能体只有读到 APPLIED 才能判定计划真正落盘
+                token, pair = self._authorized(require_write=True)
+                if not token:
+                    return
+                if not isinstance(body, dict) or body.get("v") != 1:
+                    return self._send(400, error_body("BAD_VERSION", "协议版本不匹配"))
+                if body.get("permission") != pair.get("permission"):
+                    return self._send(403, error_body("PERMISSION_MISMATCH",
+                                                      "上报包权限与配对记录不一致"))
+                owner = client_id_of(pair)
+                body_client = body.get("clientId")
+                if body_client and body_client != owner:
+                    return self._send(403, error_body("TOKEN_CONFLICT",
+                                                      "上报包的设备标识与令牌绑定的设备不一致"))
+                revision = body.get("revision")
+                if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+                    return self._send(400, error_body("BAD_REQUEST", "revision 必须是正整数"))
+                status = str(body.get("status") or "").upper()
+                if status not in ("APPLIED", "REJECTED"):
+                    return self._send(400, error_body(
+                        "BAD_REQUEST", "status 必须是 APPLIED 或 REJECTED"))
+                problems = body.get("problems") or []
+                if not isinstance(problems, list):
+                    return self._send(400, error_body("BAD_REQUEST", "problems 必须是数组"))
+                if status == "REJECTED" and not problems:
+                    problems = ["手机已拒绝该计划，但未提供明细"]
+                try:
+                    result = store.record_plan_acceptance(
+                        owner, revision, status, problems, body.get("message", ""))
+                except ValueError as exc:
+                    return self._send(400, error_body("BAD_REQUEST", str(exc)))
+                log("手机验收结果：设备 %s 版本 %d %s（当前版本 %d%s）"
+                    % (owner, revision, status, result["current"],
+                       "，迟到回执" if result["stale"] else ""))
+                return self._send(200, {
+                    "code": "OK",
+                    "clientId": owner,
+                    "revision": revision,
+                    "status": status,
+                    "stale": result["stale"],
+                    "currentRevision": result["current"],
                 })
 
             def _push_workouts(self, body):
@@ -1285,7 +1424,7 @@ class NetServer:
 
 # ---------------------------------------------------------------- 计划编码
 
-def build_plan(name, start_date, weeks, note, entries, now=None, tz=None):
+def build_plan(name, start_date, weeks, note, entries, now=None, tz=None, notes_out=None):
     """把友好参数编成 App 的 decodePlan 能直接解析的计划 JSON。"""
     now = now or now_ms()
     if not isinstance(weeks, int) or isinstance(weeks, bool) or not (2 <= weeks <= 16):
@@ -1315,7 +1454,7 @@ def build_plan(name, start_date, weeks, note, entries, now=None, tz=None):
         steps = e.get("steps")
         if steps:
             item["customWorkout"] = encode_workout_snapshot(
-                item["workoutName"] or "计划内训练", steps, now)
+                item["workoutName"] or "计划内训练", steps, now, notes_out=notes_out)
         out_entries.append(item)
     return {
         "name": str(name or "智能体训练计划"),
@@ -1356,47 +1495,929 @@ def normalize_snapshot_labels(raw):
         return raw
 
 
-def encode_workout_snapshot(name, steps, now=None):
-    """构造 BackupCodec.encodeWorkoutSnapshot 的字符串：{"workout": {...}}。"""
+# ---------------------------------------------------------------- App 训练段规则
+#
+# 这里是智能体与 App 之间的规则闸门。桥端不信任模型输出的任何字段：
+# 先按 App 的字段语义做参数映射，再逐条校验；不合规一律拒绝写入并给出修正清单，
+# 让智能体重新生成，而不是等落库后到手机上才暴露（手机侧只能整份拒收）。
+#
+# 规则来源（改这里必须同步改 App 的 AgentPlanRules.kt）：
+# - Workout.kt：durationSec / distanceM 二选一；热身只有按时间且不带目标；
+#   快跑与慢跑在同一课表内共用一种计量方式。
+# - StepEditSheet：时长 1..10859 秒、距离 100..21900 米、心率 40..220 bpm、
+#   配速 150..600 秒/公里、步频 120..220、步骤名 7 个字符。
+# - WorkoutExpander：循环组＝相邻且 repeatGroupId 相同，重复次数取组内首段，1..99。
+
+DURATION_SEC_RANGE = (1, 10859)        # 编辑上限 180'59"
+DISTANCE_M_RANGE = (100, 21900)        # 编辑上限 21.9 km
+HR_BPM_RANGE = (40, 220)
+HR_PERCENT_RANGE = (1.0, 150.0)
+PACE_SEC_RANGE = (150.0, 600.0)        # 2'30" ~ 10'00" /km
+CADENCE_RANGE = (120, 220)
+HR_GATE_BPM_RANGE = (40, 220)
+HR_GATE_PERCENT_RANGE = (1, 100)
+REPEAT_RANGE = (1, 99)
+
+# 手机在 90 秒内与桥端通信过就算在线：自动同步周期是 15 秒，留足网络抖动余量
+PHONE_ONLINE_WINDOW_MS = 90_000
+
+# 智能体可用的目标类型：DISTANCE 是历史遗留，App 编辑器不产生、引擎也不消费。
+AGENT_TARGET_TYPES = ("OPEN", "HR_RANGE", "PACE_RANGE")
+
+STEP_NAMES = {"WARMUP": "热身", "WORK": "快跑", "RECOVERY": "慢跑", "COOLDOWN": "缓和"}
+
+STEP_TYPE_ALIASES = {
+    "WARMUP": "WARMUP", "WARM_UP": "WARMUP", "WARM-UP": "WARMUP", "热身": "WARMUP",
+    "WORK": "WORK", "FAST": "WORK", "INTERVAL": "WORK", "快跑": "WORK",
+    "RECOVERY": "RECOVERY", "JOG": "RECOVERY", "SLOW": "RECOVERY",
+    "慢跑": "RECOVERY", "恢复": "RECOVERY",
+    "COOLDOWN": "COOLDOWN", "COOL_DOWN": "COOLDOWN", "COOL-DOWN": "COOLDOWN",
+    "缓和": "COOLDOWN", "冷身": "COOLDOWN",
+}
+
+TARGET_TYPE_ALIASES = {
+    "OPEN": "OPEN", "NONE": "OPEN", "NO_TARGET": "OPEN", "无目标": "OPEN",
+    "HR_RANGE": "HR_RANGE", "HEART_RATE": "HR_RANGE", "HR": "HR_RANGE", "心率": "HR_RANGE",
+    "PACE_RANGE": "PACE_RANGE", "PACE": "PACE_RANGE", "配速": "PACE_RANGE",
+    "DISTANCE": "DISTANCE", "距离": "DISTANCE",
+}
+
+STEP_KEY_ALIASES = {
+    "type": "type", "kind": "type", "stepType": "type",
+    # App 原生快照会带 order：段序以数组下标为准，这里接受但不再覆盖
+    "order": "order",
+    "durationSec": "durationSec", "duration": "durationSec",
+    "durationSeconds": "durationSec", "timeSec": "durationSec", "seconds": "durationSec",
+    "distanceM": "distanceM", "distance": "distanceM",
+    "distanceMeters": "distanceM", "meters": "distanceM",
+    "label": "label", "name": "label",
+    "repeatCount": "repeatCount", "repeat": "repeatCount", "times": "repeatCount",
+    "repeatGroupId": "repeatGroupId", "groupId": "repeatGroupId",
+    "loopGroupId": "repeatGroupId",
+    "hrGateMaxBpm": "hrGateMaxBpm", "hrGatePercent": "hrGatePercent",
+    "cadenceSpm": "cadenceSpm", "cadence": "cadenceSpm",
+    "target": "target",
+}
+
+TARGET_KEY_ALIASES = {
+    "type": "type", "kind": "type", "targetType": "type",
+    "minValue": "minValue", "min": "minValue",
+    "maxValue": "maxValue", "max": "maxValue",
+    "percent": "percent", "isPercent": "percent",
+}
+
+APP_STEP_RULES_TEXT = (
+    "App 课表硬规则（违反任意一条都会被拒绝写入并需要重新生成）：\n"
+    "1. 每段 durationSec 与 distanceM 必须二选一，禁止同时出现，也禁止都不给；\n"
+    "2. 快跑(WORK)与慢跑(RECOVERY)在同一套训练里必须统一计量方式："
+    "要么全部按时间，要么全部按距离，不允许混用；\n"
+    "3. 热身(WARMUP)只能按时间（只填 durationSec），且不能设置 target；\n"
+    "4. target.type 只能是 OPEN / HR_RANGE / PACE_RANGE。"
+    "HR_RANGE 必须显式给 percent：true=强度百分比(1..150)，false=绝对心率(40..220 bpm)；"
+    "PACE_RANGE 单位是秒/公里(150..600)，也接受 \"4:30\"；OPEN 不能带 minValue/maxValue；\n"
+    "5. 循环：同一 repeatGroupId 的步骤必须相邻且 repeatCount 相同（1..99）；"
+    "单个步骤要重复时同时给 repeatCount 与 repeatGroupId；\n"
+    "6. cadenceSpm 只用于快跑/慢跑(120..220)；hrGatePercent / hrGateMaxBpm 只用于慢跑，二选一；\n"
+    "7. 每条 entry 必须给可执行的 steps（推荐），或 list_workouts 返回的真实 workoutId；"
+    "只写 workoutName 不算训练内容；\n"
+    "8. 目标类型为 OPEN（无目标）时，workoutName/label/note/description 里禁止出现心率、配速、"
+    "步频的数值标准；\n"
+    "9. 心率、配速、步频、距离、时长必须写进对应字段（target/cadenceSpm/distanceM/durationSec），"
+    "workoutName/label/note 只写名称；文本里出现的数值必须与结构化字段一致，"
+    "否则 App 读不到、实时提醒不会触发。"
+)
+
+
+APP_PLAN_WORKFLOW_TEXT = (
+    "计划任务必须按五步闭环执行，任何一步都不能省略：\n"
+    "1) 生成：按下面列出的 App 课表硬规则生成；\n"
+    "2) 自检：调用 validate_plan。problems 非空时先修正并重新自检，"
+    "自检不通过禁止提交；\n"
+    "3) 提交：调用 set_plan。返回 status=PENDING_APP_ACCEPTANCE 只代表「已提交到桥端」，"
+    "不代表完成，也不代表手机已落盘；\n"
+    "4) 验收：调用 wait_for_plan_result（timeoutSec 默认 45）等待手机结果；"
+    "超时用 get_plan_status 继续查询；\n"
+    "5) 回传：只有 status=APPLIED 才能向用户宣布完成；status=REJECTED 时按 problems "
+    "修正后从第 1 步重走；PENDING/TIMEOUT/NO_DEVICE/PHONE_UPLOADED 一律不得宣布完成，"
+    "必须明确告诉用户「计划尚未落盘」。"
+)
+
+
+class RuleViolation(ValueError):
+    """模型输出违反 App 课表规则：携带逐条问题，调用方据此拦截并要求重新生成。"""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        ValueError.__init__(self, "；".join(self.problems))
+
+
+def _range_text(rng):
+    return "%s..%s" % (rng[0], rng[1])
+
+
+def _rule_number(value):
+    """数值解析：接受 92 / 92.0 / "92"；布尔与空值不算数字。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace("，", ",")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _clock_seconds(value):
+    """把 "4:30" / "4'30\\"" / "4分30秒" 读成秒数；读不出返回 None。"""
+    text = str(value).strip()
+    for mark in ("′", "’", "'", "分"):
+        text = text.replace(mark, ":")
+    for mark in ("″", "”", '"', "秒"):
+        text = text.replace(mark, "")
+    text = text.replace("：", ":").strip()
+    for suffix in ("/km", "/公里", "每公里"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+    if ":" not in text:
+        return None
+    parts = [part.strip() for part in text.split(":")]
+    if len(parts) != 2:
+        return None
+    minutes = _rule_number(parts[0])
+    seconds = _rule_number(parts[1])
+    if minutes is None or seconds is None:
+        return None
+    return minutes * 60 + seconds
+
+
+def _duration_seconds(value):
+    number = _rule_number(value)
+    return number if number is not None else _clock_seconds(value)
+
+
+def _distance_meters(value):
+    number = _rule_number(value)
+    if number is not None:
+        return number
+    text = str(value).strip().lower().replace(" ", "")
+    if text.endswith("km"):
+        number = _rule_number(text[:-2])
+        return None if number is None else number * 1000
+    if text.endswith("m"):
+        return _rule_number(text[:-1])
+    return None
+
+
+def _pace_seconds(value):
+    number = _rule_number(value)
+    return number if number is not None else _clock_seconds(value)
+
+
+def _int_value(value):
+    number = _rule_number(value)
+    if number is None:
+        return None
+    rounded = int(number + 0.5) if number >= 0 else int(number - 0.5)
+    if abs(number - rounded) > 1e-6:
+        return None
+    return rounded
+
+
+def _bool_value(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value) if value in (0, 1) else None
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "y", "是"):
+        return True
+    if text in ("false", "0", "no", "n", "否"):
+        return False
+    return None
+
+
+def _canonical_keys(raw, aliases, prefix, problems):
+    """把模型常用写法映射成 App 字段名；认不出的字段直接报错，绝不静默丢弃。"""
+    lowered = {str(key).lower(): canon for key, canon in aliases.items()}
+    out = {}
+    for key, value in raw.items():
+        canon = aliases.get(key) if key in aliases else lowered.get(str(key).strip().lower())
+        if canon is None:
+            problems.append("%s 有无法识别的字段 \"%s\"；可用字段：%s"
+                            % (prefix, key,
+                               "、".join(sorted(set(aliases.values()) - {"order"}))))
+            continue
+        if canon in out and out[canon] != value:
+            problems.append("%s 同时给了 \"%s\" 的两种写法，取值不一致" % (prefix, canon))
+            continue
+        out[canon] = value
+    return out
+
+
+def _normalize_target(raw, prefix, problems):
+    """把 target 映射成 App 的 TargetSpec，并校验类型与区间。"""
+    target = {"type": "OPEN", "percent": False}
+    if raw is None:
+        return target
+    if not isinstance(raw, dict):
+        problems.append(prefix + "的 target 必须是对象")
+        return target
+    fields = _canonical_keys(raw, TARGET_KEY_ALIASES, prefix + "的 target", problems)
+    raw_type = fields.get("type")
+    if raw_type is None:
+        ttype = "OPEN"
+        if "minValue" in fields or "maxValue" in fields or "percent" in fields:
+            problems.append(prefix + "的 target 缺少 type；写了 minValue/maxValue 时必须显式写 "
+                            "HR_RANGE 或 PACE_RANGE")
+    else:
+        type_key = str(raw_type).strip().upper().replace(" ", "_").replace("-", "_")
+        ttype = TARGET_TYPE_ALIASES.get(type_key) or TARGET_TYPE_ALIASES.get(str(raw_type).strip())
+        if ttype is None:
+            problems.append("%s 的 target.type=\"%s\" 无法识别；只能是 %s"
+                            % (prefix, raw_type, "/".join(AGENT_TARGET_TYPES)))
+            ttype = "OPEN"
+    if ttype == "DISTANCE":
+        problems.append(prefix + "的 target.type=DISTANCE 不受 App 支持："
+                        "距离请写在步骤的 distanceM 上，目标用 OPEN/HR_RANGE/PACE_RANGE")
+        ttype = "OPEN"
+    target["type"] = ttype
+
+    percent_raw = fields.get("percent")
+    percent = _bool_value(percent_raw) if percent_raw is not None else None
+    if percent_raw is not None and percent is None:
+        problems.append(prefix + "的 target.percent 不是布尔值")
+        percent = False
+    if ttype == "HR_RANGE" and percent is None:
+        problems.append(prefix + "的心率目标必须显式给 target.percent："
+                        "true=强度百分比(1..150)，false=绝对心率(40..220 bpm)")
+        percent = False
+    target["percent"] = bool(percent)
+
+    min_raw = fields.get("minValue")
+    max_raw = fields.get("maxValue")
+    if ttype == "OPEN":
+        if target["percent"]:
+            problems.append(prefix + "的 target.type=OPEN 不需要 percent（只有 HR_RANGE 用它）")
+        if min_raw is not None or max_raw is not None:
+            problems.append(prefix + "的 target.type=OPEN 不能带 minValue/maxValue")
+        return target
+
+    if ttype == "HR_RANGE":
+        if min_raw is None or max_raw is None:
+            problems.append(prefix + "的 HR_RANGE 必须同时给 minValue 与 maxValue")
+            return target
+        lo = _rule_number(min_raw)
+        hi = _rule_number(max_raw)
+        if lo is None or hi is None:
+            problems.append(prefix + "的心率目标不是有效数字")
+            return target
+        rng = HR_PERCENT_RANGE if target["percent"] else HR_BPM_RANGE
+        if not (rng[0] <= lo <= rng[1]) or not (rng[0] <= hi <= rng[1]):
+            unit = ("百分比 %s" % _range_text(HR_PERCENT_RANGE) if target["percent"]
+                    else "绝对心率 %s bpm" % _range_text(HR_BPM_RANGE))
+            problems.append("%s 的心率目标越界（%s）" % (prefix, unit))
+        elif lo > hi:
+            problems.append(prefix + "的心率目标 minValue 不能大于 maxValue")
+        else:
+            target["minValue"] = float(lo)
+            target["maxValue"] = float(hi)
+        return target
+
+    # PACE_RANGE
+    if target["percent"]:
+        problems.append(prefix + "的配速目标不能用 percent（percent 只用于心率）")
+    if min_raw is None and max_raw is None:
+        # 允许空配速：距离段由马拉松成绩换算（亚索 800 就是这种写法）
+        return target
+    if min_raw is None or max_raw is None:
+        problems.append(prefix + "的配速目标要么两个值都给，要么都不给")
+        return target
+    lo = _pace_seconds(min_raw)
+    hi = _pace_seconds(max_raw)
+    if lo is None or hi is None:
+        problems.append(prefix + "的配速目标不是有效秒数（也接受 \"4:30\" 写法）")
+        return target
+    if not (PACE_SEC_RANGE[0] <= lo <= PACE_SEC_RANGE[1]) or \
+            not (PACE_SEC_RANGE[0] <= hi <= PACE_SEC_RANGE[1]):
+        problems.append("%s 的配速目标越界（%s 秒/公里）" % (prefix, _range_text(PACE_SEC_RANGE)))
+    elif lo > hi:
+        problems.append(prefix + "的配速目标 minValue 不能大于 maxValue")
+    else:
+        target["minValue"] = float(lo)
+        target["maxValue"] = float(hi)
+    return target
+
+
+def normalize_step(raw, index, group_ids):
+    """把一个模型步骤映射成 App 的 Step 字段；返回 (step, notes, problems)。"""
+    prefix = "第 %d 段" % (index + 1)
+    problems = []
+    notes = []
+    if not isinstance(raw, dict):
+        return None, notes, [prefix + "不是对象"]
+    fields = _canonical_keys(raw, STEP_KEY_ALIASES, prefix, problems)
+
+    raw_type = fields.get("type", "WORK")
+    type_key = str(raw_type).strip().upper().replace(" ", "_").replace("-", "_")
+    stype = STEP_TYPE_ALIASES.get(type_key) or STEP_TYPE_ALIASES.get(str(raw_type).strip())
+    if stype is None:
+        problems.append("%s 的 type=\"%s\" 无法识别；只能是 WARMUP/WORK/RECOVERY/COOLDOWN"
+                        % (prefix, raw_type))
+        stype = "WORK"
+    step = {"order": index, "type": stype}
+
+    has_duration = "durationSec" in fields
+    has_distance = "distanceM" in fields
+    duration = None
+    distance = None
+    if has_duration:
+        duration = _duration_seconds(fields["durationSec"])
+        if duration is None:
+            problems.append(prefix + "的 durationSec 不是有效秒数（也接受 \"10:00\"）")
+    if has_distance:
+        distance = _distance_meters(fields["distanceM"])
+        if distance is None:
+            problems.append(prefix + "的 distanceM 不是有效米数（也接受 \"1km\"）")
+    if has_duration and has_distance:
+        problems.append(prefix + "同时设置了 durationSec 与 distanceM：同一段只能二选一")
+    elif not has_duration and not has_distance:
+        problems.append(prefix + "既没有 durationSec 也没有 distanceM：必须二选一")
+    if duration is not None:
+        duration_int = _int_value(duration)
+        if duration_int is None:
+            problems.append(prefix + "的 durationSec 必须是整数秒")
+        elif not (DURATION_SEC_RANGE[0] <= duration_int <= DURATION_SEC_RANGE[1]):
+            problems.append("%s 的 durationSec=%s 越界（%s 秒）"
+                            % (prefix, duration_int, _range_text(DURATION_SEC_RANGE)))
+        else:
+            step["durationSec"] = duration_int
+    if distance is not None:
+        distance_int = _int_value(distance)
+        if distance_int is None:
+            problems.append(prefix + "的 distanceM 必须是整数米")
+        elif not (DISTANCE_M_RANGE[0] <= distance_int <= DISTANCE_M_RANGE[1]):
+            problems.append("%s 的 distanceM=%s 越界（%s 米）"
+                            % (prefix, distance_int, _range_text(DISTANCE_M_RANGE)))
+        else:
+            step["distanceM"] = distance_int
+
+    if stype == "WARMUP":
+        if has_distance:
+            problems.append(prefix + "是热身：只能按时间（durationSec），不能填 distanceM")
+            step.pop("distanceM", None)
+        if duration is None:
+            problems.append(prefix + "是热身：必须给 durationSec")
+
+    step["target"] = _normalize_target(fields.get("target"), prefix, problems)
+    if stype == "WARMUP" and step["target"]["type"] != "OPEN":
+        problems.append(prefix + "是热身：不能设置目标区间")
+
+    repeat = 1
+    if "repeatCount" in fields:
+        repeat = _int_value(fields["repeatCount"])
+        if repeat is None:
+            problems.append(prefix + "的 repeatCount 不是整数")
+            repeat = 1
+        elif not (REPEAT_RANGE[0] <= repeat <= REPEAT_RANGE[1]):
+            problems.append("%s 的 repeatCount=%s 越界（%s）"
+                            % (prefix, repeat, _range_text(REPEAT_RANGE)))
+            repeat = 1
+    group = None
+    if "repeatGroupId" in fields:
+        group = _int_value(fields["repeatGroupId"])
+        if group is None or group <= 0:
+            problems.append(prefix + "的 repeatGroupId 必须是正整数")
+            group = None
+    if group is None and repeat > 1:
+        # 单段重复：App 只在循环组里读取 repeatCount，这里补成组语义，避免参数被静默忽略
+        group = (max(group_ids) + 1) if group_ids else 1
+        group_ids.add(group)
+        notes.append("%s 只写了 repeatCount=%d 没写 repeatGroupId：已补齐为循环组 %d"
+                     % (prefix, repeat, group))
+    step["repeatGroupId"] = group
+    step["repeatCount"] = repeat
+
+    if "cadenceSpm" in fields:
+        cadence = _int_value(fields["cadenceSpm"])
+        if cadence is None:
+            problems.append(prefix + "的 cadenceSpm 不是整数")
+        elif stype not in ("WORK", "RECOVERY"):
+            problems.append("%s 是%s：cadenceSpm 只用于快跑/慢跑"
+                            % (prefix, STEP_NAMES.get(stype, stype)))
+        elif not (CADENCE_RANGE[0] <= cadence <= CADENCE_RANGE[1]):
+            problems.append("%s 的 cadenceSpm=%s 越界（%s）"
+                            % (prefix, cadence, _range_text(CADENCE_RANGE)))
+        else:
+            step["cadenceSpm"] = cadence
+
+    gate_bpm = None
+    gate_percent = None
+    if "hrGateMaxBpm" in fields:
+        gate_bpm = _int_value(fields["hrGateMaxBpm"])
+        if gate_bpm is None or not (HR_GATE_BPM_RANGE[0] <= gate_bpm <= HR_GATE_BPM_RANGE[1]):
+            problems.append("%s 的 hrGateMaxBpm 越界或不是整数（%s bpm）"
+                            % (prefix, _range_text(HR_GATE_BPM_RANGE)))
+            gate_bpm = None
+    if "hrGatePercent" in fields:
+        gate_percent = _int_value(fields["hrGatePercent"])
+        if gate_percent is None or \
+                not (HR_GATE_PERCENT_RANGE[0] <= gate_percent <= HR_GATE_PERCENT_RANGE[1]):
+            problems.append("%s 的 hrGatePercent 越界或不是整数（%s%%）"
+                            % (prefix, _range_text(HR_GATE_PERCENT_RANGE)))
+            gate_percent = None
+    if gate_bpm is not None or gate_percent is not None:
+        if stype != "RECOVERY":
+            problems.append("%s 是%s：心率门槛只用于慢跑"
+                            % (prefix, STEP_NAMES.get(stype, stype)))
+        elif gate_bpm is not None and gate_percent is not None:
+            problems.append(prefix + "的 hrGateMaxBpm 与 hrGatePercent 只能二选一")
+        else:
+            if gate_bpm is not None:
+                step["hrGateMaxBpm"] = gate_bpm
+            if gate_percent is not None:
+                step["hrGatePercent"] = gate_percent
+
+    label = fields.get("label")
+    if label is not None:
+        raw_label = str(label)
+        short = truncate_step_label(raw_label)
+        if short.strip():
+            step["label"] = short
+            # 原始文本留给参数一致性校验：7 字截断可能正好把配速/心率数字截掉，
+            # 不能因为截断就漏掉「参数只写在文本里」的问题
+            if short != raw_label:
+                step["_raw_label"] = raw_label
+
+    return step, notes, problems
+
+
+def normalize_workout_steps(steps, context="训练"):
+    """把模型给的 steps 映射成 App 字段并逐条校验；返回 (normalized, problems, notes)。"""
+    problems = []
+    notes = []
+    if not isinstance(steps, list) or not steps:
+        return [], [context + " 没有任何步骤：每条 entry 必须给出可执行的 steps"], notes
+
+    # 先收集显式循环组 id，单段 repeatCount>1 补组时不会撞号
+    group_ids = set()
+    for raw in steps:
+        if not isinstance(raw, dict):
+            continue
+        value = raw.get("repeatGroupId", raw.get("groupId", raw.get("loopGroupId")))
+        parsed = _int_value(value) if value is not None else None
+        if parsed is not None and parsed > 0:
+            group_ids.add(parsed)
+
+    normalized = []
+    for index, raw in enumerate(steps):
+        step, step_notes, step_problems = normalize_step(raw, index, group_ids)
+        notes.extend(step_notes)
+        problems.extend(step_problems)
+        if step is not None:
+            normalized.append(step)
+
+    # 快跑与慢跑必须统一计量方式（App 的 About/编辑器同一条规则）
+    modes = []
+    for step in normalized:
+        if step["type"] not in ("WORK", "RECOVERY"):
+            continue
+        if step.get("distanceM") is not None and step.get("durationSec") is None:
+            modes.append((step["order"], step["type"], "距离"))
+        elif step.get("durationSec") is not None and step.get("distanceM") is None:
+            modes.append((step["order"], step["type"], "时间"))
+    if len({mode for _, _, mode in modes}) > 1:
+        detail = "、".join("第 %d 段%s按%s" % (order + 1, STEP_NAMES.get(stype, stype), mode)
+                          for order, stype, mode in modes)
+        problems.append(context + " 里快跑与慢跑混用了两种计量方式（" + detail + "）："
+                        "同一套训练必须统一为全部按时间（只填 durationSec）"
+                        "或全部按距离（只填 distanceM）")
+
+    # 循环组：相邻 + 次数一致，与 WorkoutExpander 的展开语义一致
+    groups = {}
+    for step in normalized:
+        gid = step.get("repeatGroupId")
+        if gid is None:
+            continue
+        groups.setdefault(gid, []).append((step["order"], step.get("repeatCount", 1)))
+    for gid, items in groups.items():
+        indexes = [order for order, _ in items]
+        if indexes != list(range(indexes[0], indexes[-1] + 1)):
+            problems.append("%s 的循环组 %s 跨了不连续的段（第 %s 段）：同组步骤必须相邻"
+                            % (context, gid, "、".join(str(i + 1) for i in indexes)))
+        counts = sorted({count for _, count in items})
+        if len(counts) > 1:
+            problems.append("%s 的循环组 %s 内 repeatCount 不一致（%s）：同组每一段都要写同一个次数"
+                            % (context, gid, "、".join(str(c) for c in counts)))
+    return normalized, problems, notes
+
+
+def encode_workout_snapshot(name, steps, now=None, notes_out=None):
+    """构造 BackupCodec.encodeWorkoutSnapshot 的字符串：{"workout": {...}}。
+
+    写入前先过规则闸门：字段映射 + 逐条校验。任何一条不合规都抛 RuleViolation，
+    绝不把「能编码但跑不了」的课表写进桥端存储。
+    """
+    normalized, problems, notes = normalize_workout_steps(steps, "训练「%s」" % name)
+    if notes_out is not None:
+        notes_out.extend(notes)
+    if problems:
+        raise RuleViolation(problems)
     now = now or now_ms()
     encoded = []
-    for i, s in enumerate(steps):
-        if not isinstance(s, dict):
-            raise ValueError("第 %d 个 step 不是对象" % (i + 1))
-        stype = s.get("type", "WORK")
-        if stype not in STEP_TYPES:
-            raise ValueError("step.type 必须是 %s 之一" % "/".join(STEP_TYPES))
-        step = {"order": i, "type": stype, "repeatCount": int(s.get("repeatCount", 1))}
-        if s.get("durationSec") is not None:
-            step["durationSec"] = int(s["durationSec"])
-        if s.get("distanceM") is not None:
-            step["distanceM"] = int(s["distanceM"])
-        if "durationSec" not in step and "distanceM" not in step:
-            raise ValueError("step 至少要给 durationSec 或 distanceM")
-        target = s.get("target") or {}
-        if not isinstance(target, dict):
-            raise ValueError("step.target 必须是对象")
-        ttype = target.get("type", "OPEN")
-        if ttype not in TARGET_TYPES:
-            raise ValueError("target.type 必须是 %s 之一" % "/".join(TARGET_TYPES))
-        t = {"type": ttype, "percent": bool(target.get("percent", False))}
+    for step in normalized:
+        item = {
+            "order": step["order"],
+            "type": step["type"],
+            "repeatCount": step.get("repeatCount", 1),
+        }
+        if step.get("durationSec") is not None:
+            item["durationSec"] = step["durationSec"]
+        if step.get("distanceM") is not None:
+            item["distanceM"] = step["distanceM"]
+        target = step.get("target") or {"type": "OPEN", "percent": False}
+        item["target"] = {
+            "type": target.get("type", "OPEN"),
+            "percent": bool(target.get("percent", False)),
+        }
         if target.get("minValue") is not None:
-            t["minValue"] = float(target["minValue"])
+            item["target"]["minValue"] = float(target["minValue"])
         if target.get("maxValue") is not None:
-            t["maxValue"] = float(target["maxValue"])
-        step["target"] = t
-        for k in ("repeatGroupId", "hrGateMaxBpm", "hrGatePercent", "cadenceSpm"):
-            if s.get(k) is not None:
-                step[k] = int(s[k])
-        if s.get("label"):
-            step["label"] = truncate_step_label(s["label"])
-        encoded.append(step)
+            item["target"]["maxValue"] = float(target["maxValue"])
+        for key in ("repeatGroupId", "hrGateMaxBpm", "hrGatePercent", "cadenceSpm"):
+            if step.get(key) is not None:
+                item[key] = step[key]
+        if step.get("label"):
+            item["label"] = step["label"]
+        encoded.append(item)
     workout = {
         "name": str(name), "description": "", "intensity": "", "applicableTo": "",
         "intensityLevel": "MODERATE", "createdAt": now, "updatedAt": now,
         "steps": encoded,
     }
     return json.dumps({"workout": workout}, ensure_ascii=False, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------- 文本参数一致性
+#
+# 目标区间是 App 实时提醒的唯一数据源：目标类型为 OPEN 时，标题/描述/步骤名里
+# 不能再出现心率、配速、步频标准；任何量化参数只写在文本里，App 都读不到。
+
+HR_TEXT_KEYS = ("心率", "bpm", "hrmax", "hrr", "最大心率", "储备心率")
+PACE_TEXT_KEYS = ("配速", "pace", "/km", "/公里", "每公里")
+CADENCE_TEXT_KEYS = ("步频", "步/分", "步每分钟", "spm")
+
+HR_TEXT_RANGE_RE = re.compile(
+    r"(\d{2,3})\s*(?:-|~|—|–|至|到)\s*(\d{2,3})\s*(?:bpm|次/分|次每分钟)?")
+HR_TEXT_PERCENT_RE = re.compile(
+    r"(\d{1,3}(?:\.\d+)?)\s*(?:-|~|—|–|至|到)\s*(\d{1,3}(?:\.\d+)?)\s*%")
+# 单值阈值：心率<150、心率 150、150bpm 都要能识别，不能只认区间
+HR_TEXT_SINGLE_RE = re.compile(r"(?:心率|bpm|最大心率|储备心率)\D{0,6}(\d{2,3})")
+HR_TEXT_BPM_RE = re.compile(r"(\d{2,3})\s*bpm", re.IGNORECASE)
+PACE_TEXT_RE = re.compile(r"(\d{1,2})\s*['′:：]\s*(\d{2})\s*[\"″]?")
+CADENCE_TEXT_RE = re.compile(r"(?:步频\D{0,4}(\d{3})|(\d{3})\s*(?:步/分|步每分钟|spm))")
+DISTANCE_TEXT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(km|公里|m|米)")
+DURATION_TEXT_RE = re.compile(r"(\d+)\s*(?:分钟|分)\s*(?:(\d+)\s*秒)?")
+
+
+def scan_text_standards(text):
+    """从标题/描述/步骤名里识别量化标准；只认带上下文的写法，避免把 4×4 当参数。"""
+    raw = str(text or "")
+    found = {"hr": [], "hr_percent": [], "pace": [], "cadence": [],
+             "distance": [], "duration": []}
+    if not raw.strip():
+        return found
+    lower = raw.lower()
+    if any(key in lower for key in HR_TEXT_KEYS):
+        for match in HR_TEXT_PERCENT_RE.finditer(raw):
+            found["hr_percent"].append(
+                (float(match.group(1)), float(match.group(2)), match.group(0)))
+        for match in HR_TEXT_RANGE_RE.finditer(raw):
+            found["hr"].append(
+                (int(match.group(1)), int(match.group(2)), match.group(0)))
+        for match in HR_TEXT_SINGLE_RE.finditer(raw):
+            value = int(match.group(1))
+            if not any(value in (lo, hi) for lo, hi, _ in found["hr"]):
+                found["hr"].append((value, value, match.group(0)))
+        for match in HR_TEXT_BPM_RE.finditer(raw):
+            value = int(match.group(1))
+            if not any(value in (lo, hi) for lo, hi, _ in found["hr"]):
+                found["hr"].append((value, value, match.group(0)))
+    if any(key in lower for key in PACE_TEXT_KEYS):
+        for match in PACE_TEXT_RE.finditer(raw):
+            seconds = int(match.group(1)) * 60 + int(match.group(2))
+            # 配速合理区间 2'00" ~ 15'00"；避免把 4:4 之类的时间碎片当成配速
+            if 120 <= seconds <= 900:
+                found["pace"].append((seconds, seconds, match.group(0)))
+    if any(key in lower for key in CADENCE_TEXT_KEYS):
+        for match in CADENCE_TEXT_RE.finditer(raw):
+            value = match.group(1) or match.group(2)
+            if value:
+                found["cadence"].append((int(value), int(value), match.group(0)))
+    for match in DISTANCE_TEXT_RE.finditer(raw):
+        value = float(match.group(1))
+        if match.group(2) in ("km", "公里"):
+            value *= 1000
+        found["distance"].append((int(round(value)), match.group(0)))
+    for match in DURATION_TEXT_RE.finditer(raw):
+        seconds = int(match.group(1)) * 60 + int(match.group(2) or 0)
+        found["duration"].append((seconds, match.group(0)))
+    return found
+
+
+def _text_value_matches(value, lo, hi):
+    return min(lo, hi) - 1 <= value <= max(lo, hi) + 1
+
+
+def _hr_text_matches(target, found):
+    """文本心率与结构化目标是否一致；跨单位（bpm vs 百分比）无法换算，不强行比较。"""
+    if target.get("type") != "HR_RANGE":
+        return True
+    lo = target.get("minValue")
+    hi = target.get("maxValue")
+    if lo is None or hi is None:
+        return True
+    if target.get("percent"):
+        if not found["hr_percent"]:
+            return True
+        for text_lo, text_hi, _ in found["hr_percent"]:
+            if _text_value_matches(text_lo, lo, hi) and _text_value_matches(text_hi, lo, hi):
+                return True
+        return False
+    if not found["hr"]:
+        return True
+    for text_lo, text_hi, _ in found["hr"]:
+        if _text_value_matches(text_lo, lo, hi) and _text_value_matches(text_hi, lo, hi):
+            return True
+    return False
+
+
+def _pace_text_matches(target, found):
+    if target.get("type") != "PACE_RANGE":
+        return True
+    lo = target.get("minValue")
+    hi = target.get("maxValue")
+    if lo is None or hi is None:
+        # 亚索式空配速由马拉松成绩换算，文本里的配速就是换算结果，允许
+        return True
+    if not found["pace"]:
+        return True
+    for text_lo, text_hi, _ in found["pace"]:
+        if _text_value_matches(text_lo, lo, hi) and _text_value_matches(text_hi, lo, hi):
+            return True
+    return False
+
+
+def _repeat_times(step):
+    if step.get("repeatGroupId") is None:
+        return 1
+    return max(1, int(step.get("repeatCount", 1) or 1))
+
+
+def _total_distance(steps):
+    return sum(int(step.get("distanceM") or 0) * _repeat_times(step) for step in steps)
+
+
+def _total_duration(steps):
+    return sum(int(step.get("durationSec") or 0) * _repeat_times(step) for step in steps)
+
+
+def validate_workout_text(workout_name, workout_description, steps, context):
+    """标题/描述/步骤名里的量化标准必须落到结构化字段，且不能与目标类型冲突。"""
+    problems = []
+    steps = steps or []
+    for index, step in enumerate(steps):
+        at = "%s 第 %d 段" % (context, index + 1)
+        label = step.get("_raw_label") or step.get("label") or ""
+        found = scan_text_standards(label)
+        target = step.get("target") or {}
+        ttype = target.get("type", "OPEN")
+        has_hr_text = bool(found["hr"] or found["hr_percent"])
+
+        if ttype == "OPEN" and (has_hr_text or found["pace"] or found["cadence"]):
+            problems.append(
+                "%s 目标类型是 OPEN（无目标），但步骤名含量化标准「%s」："
+                "请删除文本里的量化描述，或改成 HR_RANGE/PACE_RANGE/cadenceSpm" % (at, label))
+        if ttype == "HR_RANGE":
+            if found["pace"]:
+                problems.append("%s 目标是心率，但步骤名含配速标准「%s」："
+                                "配速必须写入 target.type=PACE_RANGE" % (at, label))
+            if not _hr_text_matches(target, found):
+                problems.append("%s 步骤名的心率标准与 target 不一致：「%s」" % (at, label))
+        if ttype == "PACE_RANGE":
+            if has_hr_text:
+                problems.append("%s 目标是配速，但步骤名含心率标准「%s」："
+                                "心率必须写入 target.type=HR_RANGE" % (at, label))
+            if not _pace_text_matches(target, found):
+                problems.append("%s 步骤名的配速标准与 target 不一致：「%s」" % (at, label))
+
+        if found["cadence"]:
+            if step.get("cadenceSpm") is None:
+                problems.append("%s 步骤名写了步频「%s」，但没有配置 cadenceSpm" % (at, label))
+            elif any(value != step["cadenceSpm"] for value, _, _ in found["cadence"]):
+                problems.append("%s 步骤名的步频与 cadenceSpm=%s 不一致"
+                                % (at, step["cadenceSpm"]))
+
+        if found["distance"]:
+            distance = step.get("distanceM")
+            text_m = found["distance"][0][0]
+            if distance is None:
+                problems.append("%s 步骤名写了距离「%s」，但本段按时间计量（没有 distanceM）"
+                                % (at, label))
+            elif abs(int(distance) - text_m) > 50:
+                problems.append("%s 步骤名的距离与 distanceM=%s 不一致" % (at, distance))
+        if found["duration"]:
+            duration = step.get("durationSec")
+            text_sec = found["duration"][0][0]
+            if duration is None:
+                problems.append("%s 步骤名写了时长「%s」，但本段按距离计量（没有 durationSec）"
+                                % (at, label))
+            elif abs(int(duration) - text_sec) > 5:
+                problems.append("%s 步骤名的时长与 durationSec=%s 不一致" % (at, duration))
+
+    title = "%s %s" % (workout_name or "", workout_description or "")
+    title_found = scan_text_standards(title)
+    hr_types = [step.get("target", {}) for step in steps
+                if step.get("target", {}).get("type") == "HR_RANGE"]
+    pace_types = [step.get("target", {}) for step in steps
+                  if step.get("target", {}).get("type") == "PACE_RANGE"]
+    cadences = [step.get("cadenceSpm") for step in steps
+                if step.get("cadenceSpm") is not None]
+
+    has_title_hr_bpm = bool(title_found["hr"])
+    has_title_hr_pct = bool(title_found["hr_percent"])
+    has_step_hr_bpm = any(not item.get("percent") for item in hr_types)
+    has_step_hr_pct = any(item.get("percent") for item in hr_types)
+    if has_title_hr_pct and not has_step_hr_pct:
+        problems.append("%s 的标题/描述写了心率百分比，但没有任何段落配置 HR_RANGE(percent=true)"
+                        % context)
+    if has_title_hr_bpm and not has_step_hr_bpm:
+        problems.append("%s 的标题/描述写了心率 bpm，但没有任何段落配置绝对心率 HR_RANGE"
+                        % context)
+    if title_found["pace"] and not pace_types:
+        problems.append("%s 的标题/描述写了配速标准，但没有任何段落配置 PACE_RANGE" % context)
+    if title_found["cadence"] and not cadences:
+        problems.append("%s 的标题/描述写了步频标准，但没有任何段落配置 cadenceSpm" % context)
+    if hr_types and has_title_hr_pct:
+        if not any(_hr_text_matches(item, title_found) for item in hr_types):
+            problems.append("%s 的标题/描述心率标准与所有段落的心率目标都不一致" % context)
+    if pace_types and title_found["pace"]:
+        if not any(_pace_text_matches(item, title_found) for item in pace_types):
+            problems.append("%s 的标题/描述配速标准与所有段落的配速目标都不一致" % context)
+
+    # 标题里的距离/时长也必须在步骤里有对应配置（或与总距离/总时长一致）
+    title_distances = [value for value, _ in title_found["distance"]]
+    if title_distances:
+        singles = [int(step["distanceM"]) for step in steps if step.get("distanceM")]
+        total = _total_distance(steps)
+        for value in title_distances:
+            if not any(abs(item - value) <= 50 for item in singles) and abs(total - value) > 50:
+                problems.append("%s 的标题/描述写了距离 %s 米，但步骤里没有对应距离"
+                                % (context, value))
+    title_durations = [value for value, _ in title_found["duration"]]
+    if title_durations:
+        singles = [int(step["durationSec"]) for step in steps if step.get("durationSec")]
+        total = _total_duration(steps)
+        for value in title_durations:
+            if not any(abs(item - value) <= 10 for item in singles) and abs(total - value) > 10:
+                problems.append("%s 的标题/描述写了时长 %s 分钟，但步骤里没有对应时长"
+                                % (context, max(1, value // 60)))
+    return problems
+
+
+def validate_plan_text(plan):
+    """计划名称/备注里的量化标准必须在计划内找到对应的结构化目标。"""
+    if not isinstance(plan, dict):
+        return []
+    entries = [entry for entry in (plan.get("entries") or []) if isinstance(entry, dict)]
+    # 引用课表库的条目无法在这里展开步骤，跳过标题级校验，交给 App 侧课表库
+    if any(not entry.get("customWorkout") and int(entry.get("workoutId") or 0) > 0
+           for entry in entries):
+        return []
+    steps = []
+    for entry in entries:
+        raw = entry.get("customWorkout")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            workout = json.loads(raw).get("workout") or {}
+        except Exception:
+            continue
+        steps.extend(workout.get("steps") or [])
+    if not steps:
+        return []
+    title = "%s %s" % (plan.get("name", ""), plan.get("note", ""))
+    found = scan_text_standards(title)
+    problems = []
+    has_hr_bpm = any(step.get("target", {}).get("type") == "HR_RANGE"
+                     and not step.get("target", {}).get("percent") for step in steps)
+    has_hr_pct = any(step.get("target", {}).get("type") == "HR_RANGE"
+                     and step.get("target", {}).get("percent") for step in steps)
+    has_pace = any(step.get("target", {}).get("type") == "PACE_RANGE" for step in steps)
+    has_cadence = any(step.get("cadenceSpm") is not None for step in steps)
+    if found["hr"] and not has_hr_bpm:
+        problems.append("计划名称/备注写了心率 bpm，但计划里没有任何段落配置绝对心率目标")
+    if found["hr_percent"] and not has_hr_pct:
+        problems.append("计划名称/备注写了心率百分比，但计划里没有任何段落配置百分比心率目标")
+    if found["pace"] and not has_pace:
+        problems.append("计划名称/备注写了配速标准，但计划里没有任何段落配置 PACE_RANGE")
+    if found["cadence"] and not has_cadence:
+        problems.append("计划名称/备注写了步频标准，但计划里没有任何段落配置 cadenceSpm")
+    return problems
+
+
+def validate_custom_workout_snapshot(raw, context):
+    """校验一份 App 原生 customWorkout 快照里的步骤；返回问题清单。"""
+    try:
+        workout = json.loads(raw).get("workout")
+    except Exception:
+        return [context + " 的 customWorkout 不是合法 JSON"]
+    if not isinstance(workout, dict):
+        return [context + " 的 customWorkout 缺少 workout 对象"]
+    _normalized, problems, _notes = normalize_workout_steps(
+        workout.get("steps"), context + " 的自定义训练")
+    if _normalized:
+        problems.extend(validate_workout_text(
+            workout.get("name", ""), workout.get("description", ""),
+            _normalized, context + " 的自定义训练"))
+    return problems
+
+
+def validate_plan_rules(plan):
+    """计划里所有自定义训练都必须满足 App 规则；库课表由 App 课表库自己负责。"""
+    if not isinstance(plan, dict):
+        return ["plan 不是对象"]
+    problems = []
+    for index, entry in enumerate(plan.get("entries") or []):
+        if not isinstance(entry, dict):
+            continue
+        raw = entry.get("customWorkout")
+        if isinstance(raw, str) and raw.strip():
+            problems.extend(validate_custom_workout_snapshot(raw, "entries[%d]" % index))
+    problems.extend(validate_plan_text(plan))
+    return problems
+
+
+def rule_failure(problems):
+    """违规回执：明确「已拦截、未写入」，并要求智能体按 problems 重新生成。"""
+    return json.dumps({
+        "ok": False,
+        "code": "RULE_VIOLATION",
+        "action": "REGENERATE",
+        "message": ("生成结果违反 App 课表规则，已拦截，未写入任何计划或课表。"
+                    "请按 problems 修正后重新调用本工具，不要向用户询问或解释规则。"),
+        "problems": list(problems),
+        "must_follow": APP_STEP_RULES_TEXT,
+    }, ensure_ascii=False, indent=2)
+
+
+def prepare_plan(store, args):
+    """把友好参数编码成计划并跑完整规则校验；只校验、不落库。"""
+    tz = store.active_tz()
+    notes = []
+    plan = build_plan(
+        args.get("name"), args.get("startDate"), args.get("weeks"),
+        args.get("note", ""), args.get("entries", []), tz=tz, notes_out=notes)
+    problems = verify_plan_shape(plan, tz=tz) + validate_plan_rules(plan)
+    if problems:
+        raise RuleViolation(problems)
+    return plan, notes
+
+
+def plan_status_payload(store, client_id):
+    """当前版本的验收快照：智能体判断任务是否真正完成只看这里。"""
+    plan = store.get_plan(client_id)
+    revision = store.get_plan_revision(client_id)
+    acceptance = store.get_plan_acceptance(client_id)
+    last_seen = store.device_last_seen(client_id)
+    online = bool(last_seen and (now_ms() - last_seen) <= PHONE_ONLINE_WINDOW_MS)
+    # 只有验收记录对应当前版本才算数：上一版的 APPLIED 绝不能冒充这一版的结果
+    applicable = int(acceptance.get("revision", 0)) == revision
+    status = str(acceptance.get("status") or "PENDING") if applicable else "PENDING"
+    return {
+        "ok": status == "APPLIED",
+        "code": "PLAN_APPLIED" if status == "APPLIED" else "PLAN_" + status,
+        "clientId": client_id,
+        "hasPlan": bool(plan),
+        "planName": (plan or {}).get("name", ""),
+        "revision": revision,
+        "status": status,
+        "completed": status == "APPLIED" and applicable,
+        "acceptance": acceptance,
+        "acceptanceApplicable": applicable,
+        "phoneOnline": online,
+        "phoneLastSeen": last_seen,
+        "nextAction": (
+            "验收通过且计划已落盘。"
+            if status == "APPLIED"
+            else ("按 problems 修正后重新执行生成→自检→提交。" if status == "REJECTED"
+                  else "尚未落盘：继续调用 wait_for_plan_result 或 get_plan_status；"
+                       "若手机长时间离线，明确告诉用户计划未同步。")
+        ),
+    }
+
 
 
 def workout_snapshot_ok(raw):
@@ -1454,12 +2475,27 @@ def normalize_plan_for_app(plan):
     这里在落库前补齐编码（复用 build_plan 的同一函数），返回补齐条数。
     """
     fixed = 0
-    for entry in plan.get("entries", []):
+    for index, entry in enumerate(plan.get("entries") or []):
         if not isinstance(entry, dict):
             continue
+        where = "entries[%d]" % index
+        # 有的写入方把 customWorkout 直接给成对象：先落成 App 能读的字符串，不能静默丢掉
+        raw_custom = entry.get("customWorkout")
+        if isinstance(raw_custom, dict):
+            nested = raw_custom.get("workout")
+            if isinstance(nested, dict):
+                entry["customWorkout"] = json.dumps(
+                    raw_custom, ensure_ascii=False, separators=(",", ":"))
+            elif isinstance(raw_custom.get("steps"), list):
+                name = str(entry.get("workoutName") or plan.get("name") or "计划内训练")
+                entry["customWorkout"] = encode_workout_snapshot(name, raw_custom["steps"])
+                fixed += 1
         # 已有的 customWorkout 也要按 7 字规则整理，避免「接口写长名、打开编辑才截短」
         if isinstance(entry.get("customWorkout"), str):
             entry["customWorkout"] = normalize_snapshot_labels(entry["customWorkout"])
+            problems = validate_custom_workout_snapshot(entry["customWorkout"], where)
+            if problems:
+                raise RuleViolation(problems)
         if entry_trainable(entry):
             continue
         steps = entry.get("steps")
@@ -1537,6 +2573,130 @@ def verify_plan_shape(plan, tz=None):
 
 # ---------------------------------------------------------------- MCP 工具
 
+def plan_args_schema():
+    """validate_plan 的友好参数 schema；字段与 set_plan 完全一致，避免自检与提交两套口径。"""
+    return {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "计划名"},
+            "startDate": {"type": "string", "description": "起始周的周一，yyyy-MM-dd"},
+            "weeks": {"type": "integer", "description": "周数 2..16"},
+            "note": {"type": "string", "description": "备注"},
+            "clientId": {"type": "string", "description": "写入哪台设备的计划；省略则写当前活跃设备"},
+            "entries": {
+                "type": "array",
+                "description": (
+                    "逐条训练。每条必须二选一：给 steps（推荐，计划内自定义训练）"
+                    "或给 list_workouts 返回的真实 workoutId；只写 workoutName 不算训练内容。"
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "date": {"type": "string", "description": "yyyy-MM-dd"},
+                        "hour": {"type": "integer", "default": 19},
+                        "minute": {"type": "integer", "default": 0},
+                        "workoutName": {
+                            "type": "string",
+                            "description": "训练显示名；只写名字不会生成训练内容，也不要在这里写配速/心率/步频数值",
+                        },
+                        "workoutId": {
+                            "type": "integer",
+                            "default": 0,
+                            "description": "课表库里已存在的课表 id（先用 list_workouts 查）；0 表示使用 steps",
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": (
+                                "计划内自定义训练的步骤。每段 durationSec 与 distanceM 二选一；"
+                                "快跑与慢跑必须统一计量方式；热身只能按时间且不带目标。"
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {
+                                        "type": "string",
+                                        "enum": list(STEP_TYPES),
+                                        "description": (
+                                            "WARMUP=热身（只能按时间、不能带 target）；"
+                                            "WORK=快跑；RECOVERY=慢跑；COOLDOWN=缓和"
+                                        ),
+                                    },
+                                    "durationSec": {
+                                        "type": "integer",
+                                        "description": "按时间计量：秒，1..10859；与 distanceM 二选一",
+                                    },
+                                    "distanceM": {
+                                        "type": "integer",
+                                        "description": "按距离计量：米，100..21900；与 durationSec 二选一",
+                                    },
+                                    "label": {
+                                        "type": "string",
+                                        "description": "步骤显示名，最多 7 个字符；不要在这里写配速/心率/步频数值",
+                                    },
+                                    "repeatCount": {
+                                        "type": "integer",
+                                        "default": 1,
+                                        "description": (
+                                            "循环次数 1..99。放在循环组里时，同组每一段都写同一个值"
+                                        ),
+                                    },
+                                    "repeatGroupId": {
+                                        "type": "integer",
+                                        "description": (
+                                            "循环组 id：同组步骤必须相邻；单个步骤重复也要建组"
+                                        ),
+                                    },
+                                    "hrGateMaxBpm": {
+                                        "type": "integer",
+                                        "description": "仅慢跑：恢复段心率门槛 40..220 bpm，与 hrGatePercent 二选一",
+                                    },
+                                    "hrGatePercent": {
+                                        "type": "integer",
+                                        "description": "仅慢跑：恢复段心率门槛 1..100 %，与 hrGateMaxBpm 二选一",
+                                    },
+                                    "cadenceSpm": {
+                                        "type": "integer",
+                                        "description": "仅快跑/慢跑：本段节拍器步频 120..220",
+                                    },
+                                    "target": {
+                                        "type": "object",
+                                        "description": (
+                                            "目标区间。HR_RANGE 必须同时给 minValue/maxValue "
+                                            "并显式写 percent；PACE_RANGE 单位秒/公里"
+                                            "（也接受 \"4:30\"），两个值要么都给要么都不给；"
+                                            "OPEN 不能带 minValue/maxValue。"
+                                        ),
+                                        "properties": {
+                                            "type": {
+                                                "type": "string",
+                                                "enum": list(AGENT_TARGET_TYPES),
+                                            },
+                                            "minValue": {"type": "number"},
+                                            "maxValue": {"type": "number"},
+                                            "percent": {
+                                                "type": "boolean",
+                                                "description": (
+                                                    "仅 HR_RANGE 必填：true=强度百分比(1..150)，"
+                                                    "false=绝对心率(40..220 bpm)"
+                                                ),
+                                            },
+                                        },
+                                        "required": ["type"],
+                                    },
+                                },
+                                "required": ["type"],
+                            },
+                        },
+                    },
+                    "required": ["date"],
+                },
+            },
+        },
+        "required": ["name", "startDate", "weeks", "entries"],
+    }
+
+
 def tool_defs():
     return [
         {
@@ -1564,11 +2724,31 @@ def tool_defs():
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
+            "name": "validate_plan",
+            "description": (
+                "计划自检：按 App 课表规则对提交前的计划做全字段校验，不写入任何数据。"
+                "problems 非空时必须修正并重新自检，禁止进入提交流程。\n"
+                + APP_STEP_RULES_TEXT
+            ),
+            "inputSchema": plan_args_schema(),
+        },
+        {
             "name": "set_plan",
             "description": (
-                "创建训练计划。每条 entry 用 date(yyyy-MM-dd) 指定训练日；"
-                "给 steps 则生成计划内自定义训练（不依赖课表库），不给则用 workoutId 引用课表库。"
-                "weeks 必须是 2..16。若已有计划，会先留档旧计划再写入新计划，绝不直接覆盖；"
+                "提交训练计划（写入前按 App 课表规则强校验，违规一律拒绝并需要重新生成）。\n"
+                "提交成功只代表桥端已接收，**任务尚未完成**：必须调用 wait_for_plan_result "
+                "等待手机验收，只有 APPLIED 才能判定完成。\n"
+                + APP_STEP_RULES_TEXT +
+                "\n示例（4×4 间歇，全部按时间计量）：\n"
+                "entries: [{\"date\":\"2026-11-24\",\"workoutName\":\"挪威 4×4\",\"steps\":["
+                "{\"type\":\"WARMUP\",\"durationSec\":600},"
+                "{\"type\":\"WORK\",\"durationSec\":240,\"repeatGroupId\":1,\"repeatCount\":4,"
+                "\"target\":{\"type\":\"HR_RANGE\",\"percent\":true,\"minValue\":78,\"maxValue\":93}},"
+                "{\"type\":\"RECOVERY\",\"durationSec\":180,\"repeatGroupId\":1,\"repeatCount\":4,"
+                "\"hrGatePercent\":70},"
+                "{\"type\":\"COOLDOWN\",\"durationSec\":300}]}]\n"
+                "每条 entry 用 date(yyyy-MM-dd) 指定训练日；weeks 必须是 2..16。"
+                "若已有计划，会先留档旧计划再写入新计划，绝不直接覆盖；"
                 "手机读写档打开时会自动同步并同样先归档旧计划。"
             ),
             "inputSchema": {
@@ -1581,7 +2761,10 @@ def tool_defs():
                     "clientId": {"type": "string", "description": "写入哪台设备的计划；省略则写当前活跃设备"},
                     "entries": {
                         "type": "array",
-                        "description": "逐条训练",
+                        "description": (
+                            "逐条训练。每条必须二选一：给 steps（推荐，计划内自定义训练）"
+                            "或给 list_workouts 返回的真实 workoutId；只写 workoutName 不算训练内容。"
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1589,33 +2772,96 @@ def tool_defs():
                                 "date": {"type": "string", "description": "yyyy-MM-dd"},
                                 "hour": {"type": "integer", "default": 19},
                                 "minute": {"type": "integer", "default": 0},
-                                "workoutName": {"type": "string"},
-                                "workoutId": {"type": "integer", "default": 0},
+                                "workoutName": {
+                                    "type": "string",
+                                    "description": "训练显示名；只写名字不会生成训练内容，也不要在这里写配速/心率/步频数值",
+                                },
+                                "workoutId": {
+                                    "type": "integer",
+                                    "default": 0,
+                                    "description": "课表库里已存在的课表 id（先用 list_workouts 查）；0 表示使用 steps",
+                                },
                                 "steps": {
                                     "type": "array",
-                                    "description": "自定义训练步骤；type=WARMUP/WORK/RECOVERY/COOLDOWN",
+                                    "description": (
+                                        "计划内自定义训练的步骤。每段 durationSec 与 distanceM 二选一；"
+                                        "快跑与慢跑必须统一计量方式；热身只能按时间且不带目标。"
+                                    ),
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "type": {"type": "string", "enum": list(STEP_TYPES)},
-                                            "durationSec": {"type": "integer"},
-                                            "distanceM": {"type": "integer"},
-                                            "label": {"type": "string"},
-                                            "repeatCount": {"type": "integer", "default": 1},
-                                            "repeatGroupId": {"type": "integer"},
-                                            "hrGateMaxBpm": {"type": "integer"},
-                                            "hrGatePercent": {"type": "integer"},
-                                            "cadenceSpm": {"type": "integer"},
+                                            "type": {
+                                                "type": "string",
+                                                "enum": list(STEP_TYPES),
+                                                "description": (
+                                                    "WARMUP=热身（只能按时间、不能带 target）；"
+                                                    "WORK=快跑；RECOVERY=慢跑；COOLDOWN=缓和"
+                                                ),
+                                            },
+                                            "durationSec": {
+                                                "type": "integer",
+                                                "description": "按时间计量：秒，1..10859；与 distanceM 二选一",
+                                            },
+                                            "distanceM": {
+                                                "type": "integer",
+                                                "description": "按距离计量：米，100..21900；与 durationSec 二选一",
+                                            },
+                                            "label": {
+                                                "type": "string",
+                                                "description": "步骤显示名，最多 7 个字符；不要在这里写配速/心率/步频数值",
+                                            },
+                                            "repeatCount": {
+                                                "type": "integer",
+                                                "default": 1,
+                                                "description": (
+                                                    "循环次数 1..99。放在循环组里时，同组每一段都写同一个值"
+                                                ),
+                                            },
+                                            "repeatGroupId": {
+                                                "type": "integer",
+                                                "description": (
+                                                    "循环组 id：同组步骤必须相邻；单个步骤重复也要建组"
+                                                ),
+                                            },
+                                            "hrGateMaxBpm": {
+                                                "type": "integer",
+                                                "description": "仅慢跑：恢复段心率门槛 40..220 bpm，与 hrGatePercent 二选一",
+                                            },
+                                            "hrGatePercent": {
+                                                "type": "integer",
+                                                "description": "仅慢跑：恢复段心率门槛 1..100 %，与 hrGateMaxBpm 二选一",
+                                            },
+                                            "cadenceSpm": {
+                                                "type": "integer",
+                                                "description": "仅快跑/慢跑：本段节拍器步频 120..220",
+                                            },
                                             "target": {
                                                 "type": "object",
+                                                "description": (
+                                                    "目标区间。HR_RANGE 必须同时给 minValue/maxValue "
+                                                    "并显式写 percent；PACE_RANGE 单位秒/公里"
+                                                    "（也接受 \"4:30\"），两个值要么都给要么都不给；"
+                                                    "OPEN 不能带 minValue/maxValue。"
+                                                ),
                                                 "properties": {
-                                                    "type": {"type": "string", "enum": list(TARGET_TYPES)},
+                                                    "type": {
+                                                        "type": "string",
+                                                        "enum": list(AGENT_TARGET_TYPES),
+                                                    },
                                                     "minValue": {"type": "number"},
                                                     "maxValue": {"type": "number"},
-                                                    "percent": {"type": "boolean"},
+                                                    "percent": {
+                                                        "type": "boolean",
+                                                        "description": (
+                                                            "仅 HR_RANGE 必填：true=强度百分比(1..150)，"
+                                                            "false=绝对心率(40..220 bpm)"
+                                                        ),
+                                                    },
                                                 },
+                                                "required": ["type"],
                                             },
                                         },
+                                        "required": ["type"],
                                     },
                                 },
                             },
@@ -1628,7 +2874,7 @@ def tool_defs():
         },
         {
             "name": "get_plan",
-            "description": "读取当前已写入的计划（App 原生 JSON）。用于核对或修改前查看。",
+            "description": "读取当前已写入的计划（App 原生 JSON）。用于核对或修改前查看。注意：读到计划不代表手机已验收，必须用 get_plan_status 看验收状态。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1637,11 +2883,49 @@ def tool_defs():
             },
         },
         {
+            "name": "get_plan_status",
+            "description": (
+                "查询当前版本的手机验收状态（不阻塞）。返回 status：PENDING/APPLIED/REJECTED/"
+                "PHONE_UPLOADED；REJECTED 会带手机给出的 problems。"
+                "任何 PENDING 以外的结论都只能由这里或 wait_for_plan_result 得出。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clientId": {"type": "string", "description": "查哪台设备；省略则用当前活跃设备"},
+                },
+            },
+        },
+        {
+            "name": "wait_for_plan_result",
+            "description": (
+                "等待手机对当前提交版本的验收结果（长轮询，默认最多 45 秒）。"
+                "只有返回 status=APPLIED 才能向用户宣布任务完成；"
+                "REJECTED 按 problems 修正后重新执行生成→自检→提交；"
+                "TIMEOUT/PENDING/NO_DEVICE/PHONE_UPLOADED 都表示计划尚未落盘，"
+                "不得默认成功，应继续用 get_plan_status 查询或提示用户检查手机。"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "clientId": {"type": "string", "description": "等哪台设备；省略则用当前活跃设备"},
+                    "timeoutSec": {
+                        "type": "integer",
+                        "default": 45,
+                        "description": "最长等待秒数，1..120；超时不代表成功",
+                    },
+                },
+            },
+        },
+        {
             "name": "set_plan_json",
             "description": (
                 "直接写入 App 原生计划 JSON（当 set_plan 的友好参数不够用时使用）。"
-                "字段：name/startDate(epoch毫秒)/weeks/note/entries。"
-                "已有计划会先留档再写入。"
+                "字段：name/startDate(epoch毫秒)/weeks/note/entries；entry 的 customWorkout "
+                "必须是 {\"workout\":{\"steps\":[...]}} 字符串或同结构对象。"
+                "写入前与 set_plan 走同一套 App 课表规则校验（含 steps 与 customWorkout 里的每一段），"
+                "违规一律拒绝并需要重新生成。已有计划会先留档再写入。\n"
+                + APP_STEP_RULES_TEXT
             ),
             "inputSchema": {
                 "type": "object",
@@ -1669,7 +2953,9 @@ def tool_defs():
                 "snapshot（App 原生 {\"workout\":{\"steps\":[...]}} JSON 字符串）；"
                 "也可用 name + steps 由工具编码。写入范围仅限「我的课表」："
                 "带 isPreset/presetKey 或命中本机内置预设的条目只会另存副本，绝不覆盖预设。"
-                "手机联网且权限为读写时会自动同步落库。"
+                "写入前按 App 课表规则强校验，违规一律拒绝并需要重新生成。"
+                "手机联网且权限为读写时会自动同步落库。\n"
+                + APP_STEP_RULES_TEXT
             ),
             "inputSchema": {
                 "type": "object",
@@ -1683,7 +2969,11 @@ def tool_defs():
                                 "id": {"type": "integer"},
                                 "name": {"type": "string"},
                                 "snapshot": {"type": "string"},
-                                "steps": {"type": "array", "items": {"type": "object"}},
+                                "steps": {
+                                    "type": "array",
+                                    "description": "与 set_plan 的 steps 同一套字段与规则",
+                                    "items": {"type": "object"},
+                                },
                                 "isPreset": {"type": "boolean", "description": "来源标记：true 表示内置预设，手机只会另存副本，不会覆盖原课表"},
                                 "presetKey": {"type": "string"},
                             },
@@ -1825,6 +3115,10 @@ def call_tool(store, name, args, net=None):
                     "entries": len((slot.get("plan") or {}).get("entries", []) or []),
                     "parseableEntries": app_parseable_count(slot.get("plan")),
                     "archives": len(slot.get("archives", []) or []),
+                    # 智能体判断任务是否完成只看这一项：PENDING/REJECTED 都不算落盘
+                    "acceptance": (slot.get("acceptance") or {}).get("status", "PENDING"),
+                    "acceptanceRevision": int(
+                        (slot.get("acceptance") or {}).get("revision", 0) or 0),
                 }
             status = {
                 "device": snap["device"],
@@ -1839,6 +3133,8 @@ def call_tool(store, name, args, net=None):
                 "plans": plans,
                 "activePlanName": (snap.get("plans", {}).get(active) or {}).get("plan", {}).get("name", "")
                 if (snap.get("plans", {}).get(active) or {}).get("plan") else "",
+                "activeAcceptance": (snap.get("plans", {}).get(active) or {}).get("acceptance")
+                or {"status": "PENDING"},
                 "hasPlan": bool((snap.get("plans", {}).get(active) or {}).get("plan")),
                 "parseableEntries": app_parseable_count(
                     (snap.get("plans", {}).get(active) or {}).get("plan")),
@@ -1848,22 +3144,78 @@ def call_tool(store, name, args, net=None):
             }
             return json.dumps(status, ensure_ascii=False, indent=2), False
 
+        if name == "validate_plan":
+            # 自检只校验，不写库；失败是「检查结果」，不是工具故障，交给智能体修正
+            try:
+                plan, notes = prepare_plan(store, args)
+            except RuleViolation as exc:
+                return json.dumps({
+                    "ok": False,
+                    "code": "SELF_CHECK_FAILED",
+                    "action": "FIX_AND_RECHECK",
+                    "message": "自检未通过，禁止提交。请按 problems 修正后重新调用 validate_plan。",
+                    "problems": exc.problems,
+                    "must_follow": APP_STEP_RULES_TEXT,
+                }, ensure_ascii=False, indent=2), False
+            except (TypeError, ValueError) as exc:
+                return json.dumps({
+                    "ok": False,
+                    "code": "SELF_CHECK_FAILED",
+                    "action": "FIX_AND_RECHECK",
+                    "message": "自检未通过，禁止提交。",
+                    "problems": [str(exc)],
+                }, ensure_ascii=False, indent=2), False
+            return json.dumps({
+                "ok": True,
+                "code": "SELF_CHECK_PASSED",
+                "action": "SUBMIT",
+                "message": "自检通过，可以调用 set_plan 提交。提交后仍需等待手机验收。",
+                "name": plan["name"],
+                "weeks": plan["weeks"],
+                "entries": len(plan["entries"]),
+                "parseableEntries": app_parseable_count(plan),
+                "mapping": notes,
+            }, ensure_ascii=False, indent=2), False
+
         if name == "set_plan":
-            tz = store.active_tz()
-            plan = build_plan(
-                args.get("name"), args.get("startDate"), args.get("weeks"),
-                args.get("note", ""), args.get("entries", []), tz=tz)
-            problems = verify_plan_shape(plan, tz=tz)
-            if problems:
-                return "计划校验失败：" + "；".join(problems), True
+            try:
+                plan, notes = prepare_plan(store, args)
+            except RuleViolation as exc:
+                return rule_failure(exc.problems), True
+            except (TypeError, ValueError) as exc:
+                return rule_failure([str(exc)]), True
             target = _target_client(store, args)
             archived = store.set_plan(target, plan)
-            entries = plan["entries"]
-            prefix = ("已归档旧计划「%s」；" % archived) if archived else ""
-            return (prefix + "已写入计划「%s」（设备 %s）：%d 周，%d 次训练（%s 起），"
-                    "App 可解析 %d 条。手机打开数据共享接口后会自动同步。"
-                    % (plan["name"], target, plan["weeks"], len(entries),
-                       args.get("startDate"), app_parseable_count(plan))), False
+            revision = store.get_plan_revision(target)
+            last_seen = store.device_last_seen(target)
+            phone_online = bool(
+                last_seen and (now_ms() - last_seen) <= PHONE_ONLINE_WINDOW_MS)
+            return json.dumps({
+                "ok": True,
+                "code": "PLAN_SUBMITTED",
+                "action": "WAIT_FOR_APP_ACCEPTANCE",
+                "status": "PENDING_APP_ACCEPTANCE",
+                "completed": False,
+                "clientId": target,
+                "revision": revision,
+                "name": plan["name"],
+                "weeks": plan["weeks"],
+                "entries": len(plan["entries"]),
+                "parseableEntries": app_parseable_count(plan),
+                "archivedPlan": archived,
+                "mapping": notes,
+                "phoneSeen": last_seen > 0,
+                "phoneOnline": phone_online,
+                "message": ("计划已提交到桥端，但任务尚未完成：手机还没有验收。"
+                            "不要向用户宣布成功。"),
+                "nextAction": (
+                    "调用 wait_for_plan_result 等待手机返回 APPLIED/REJECTED；"
+                    "超时用 get_plan_status 继续查，未拿到 APPLIED 前不得判定完成。"
+                    if phone_online else
+                    "手机当前不在线：先让用户打开 App 的数据共享接口，"
+                    "再调用 wait_for_plan_result；不要判定完成。"
+                ),
+            }, ensure_ascii=False, indent=2), False
 
         if name == "get_plan":
             target = _target_client(store, args)
@@ -1873,6 +3225,61 @@ def call_tool(store, name, args, net=None):
                         % target), False
             return json.dumps(plan, ensure_ascii=False, indent=2), False
 
+        if name == "get_plan_status":
+            target = _target_client(store, args)
+            payload = plan_status_payload(store, target)
+            return json.dumps(payload, ensure_ascii=False, indent=2), False
+
+        if name == "wait_for_plan_result":
+            target = _target_client(store, args)
+            try:
+                timeout = int(args.get("timeoutSec", 45))
+            except (TypeError, ValueError):
+                timeout = 45
+            timeout = max(1, min(120, timeout))
+            if not store.get_plan(target):
+                payload = plan_status_payload(store, target)
+                payload.update({
+                    "ok": False,
+                    "code": "NO_PLAN",
+                    "status": "NO_PLAN",
+                    "completed": False,
+                    "message": "还没有提交计划，无法等待验收。",
+                    "nextAction": "先调用 validate_plan 自检，再用 set_plan 提交。",
+                })
+                return json.dumps(payload, ensure_ascii=False, indent=2), False
+            if store.device_last_seen(target) == 0:
+                payload = plan_status_payload(store, target)
+                payload.update({
+                    "ok": False,
+                    "code": "NO_DEVICE",
+                    "status": "NO_DEVICE",
+                    "completed": False,
+                    "message": "这台设备从未连接过桥端，计划没有落盘。",
+                    "nextAction": "让用户先在 App 里打开数据共享接口并连接本机，再重新查询。",
+                })
+                return json.dumps(payload, ensure_ascii=False, indent=2), False
+            deadline = time.time() + timeout
+            while True:
+                payload = plan_status_payload(store, target)
+                status = payload.get("status")
+                # APPLIED / REJECTED / PHONE_UPLOADED 都是手机的最终表态，立即回传
+                if status in ("APPLIED", "REJECTED", "PHONE_UPLOADED"):
+                    payload["waitedSec"] = max(0, timeout - int(max(0, deadline - time.time())))
+                    return json.dumps(payload, ensure_ascii=False, indent=2), False
+                if time.time() >= deadline:
+                    payload.update({
+                        "ok": False,
+                        "code": "PLAN_PENDING",
+                        "completed": False,
+                        "waitedSec": timeout,
+                        "message": "等待超时，手机还没有回传验收结果，计划未确认落盘。",
+                        "nextAction": ("不要判定完成。调用 get_plan_status 继续查询；"
+                                       "若 phoneOnline=false，提示用户检查手机与本机连接。"),
+                    })
+                    return json.dumps(payload, ensure_ascii=False, indent=2), False
+                time.sleep(1.0)
+
         if name == "set_plan_json":
             plan = args.get("plan")
             fixed = 0
@@ -1880,19 +3287,43 @@ def call_tool(store, name, args, net=None):
                 try:
                     # 兼容 set_plan 风格：有 steps 但没有 customWorkout 的 entry 自动补编码
                     fixed = normalize_plan_for_app(plan)
+                except RuleViolation as exc:
+                    return rule_failure(exc.problems), True
                 except (TypeError, ValueError) as exc:
-                    return ("步骤补齐失败：%s。请改用 set_plan，或提供合法的 customWorkout 字符串。"
-                            % exc), True
-            problems = verify_plan_shape(plan, tz=store.active_tz())
+                    return rule_failure([str(exc)]), True
+            problems = verify_plan_shape(plan, tz=store.active_tz()) + validate_plan_rules(plan)
             if problems:
-                return "计划校验失败：" + "；".join(problems), True
+                return rule_failure(problems), True
             target = _target_client(store, args)
             archived = store.set_plan(target, plan)
-            prefix = ("已归档旧计划「%s」；" % archived) if archived else ""
-            suffix = ("其中 %d 条 steps 已自动编码成 App 原生 customWorkout。" % fixed) if fixed else ""
-            return (prefix + "已写入原生计划「%s」（设备 %s），%d 次训练，App 可解析 %d 条。%s"
-                    % (plan.get("name", ""), target, len(plan.get("entries", [])),
-                       app_parseable_count(plan), suffix)), False
+            revision = store.get_plan_revision(target)
+            last_seen = store.device_last_seen(target)
+            phone_online = bool(
+                last_seen and (now_ms() - last_seen) <= PHONE_ONLINE_WINDOW_MS)
+            return json.dumps({
+                "ok": True,
+                "code": "PLAN_SUBMITTED",
+                "action": "WAIT_FOR_APP_ACCEPTANCE",
+                "status": "PENDING_APP_ACCEPTANCE",
+                "completed": False,
+                "clientId": target,
+                "revision": revision,
+                "name": plan.get("name", ""),
+                "entries": len(plan.get("entries", [])),
+                "parseableEntries": app_parseable_count(plan),
+                "archivedPlan": archived,
+                "autoEncodedEntries": fixed,
+                "phoneSeen": last_seen > 0,
+                "phoneOnline": phone_online,
+                "message": ("原生计划已提交到桥端，但任务尚未完成：手机还没有验收。"
+                            "不要向用户宣布成功。"),
+                "nextAction": (
+                    "调用 wait_for_plan_result 等待手机返回 APPLIED/REJECTED；"
+                    "超时用 get_plan_status 继续查。"
+                    if phone_online else
+                    "手机当前不在线：先让用户打开 App 的数据共享接口，再等待验收。"
+                ),
+            }, ensure_ascii=False, indent=2), False
 
         if name == "list_workouts":
             target = _target_client(store, args)
@@ -1931,18 +3362,19 @@ def call_tool(store, name, args, net=None):
                     try:
                         snapshot = encode_workout_snapshot(
                             item.get("name") or "智能体课表", item["steps"])
+                    except RuleViolation as exc:
+                        return rule_failure(exc.problems), True
                     except (TypeError, ValueError) as exc:
-                        return "workouts[%d] 步骤编码失败：%s" % (index, exc), True
+                        return rule_failure(
+                            ["workouts[%d] 步骤编码失败：%s" % (index, exc)]), True
                 if not workout_snapshot_ok(snapshot):
                     return ("workouts[%d] 缺少可解析的 snapshot（需 "
                             "{\"workout\":{\"steps\":[...]}}）" % index), True
-                # 空步骤课表写回手机只会把用户课表清成 0 段，智能体侧直接拒绝
-                try:
-                    steps_count = len(json.loads(snapshot).get("workout", {}).get("steps") or [])
-                except Exception:
-                    steps_count = 0
-                if steps_count <= 0:
-                    return "workouts[%d] 的课表没有步骤，拒绝写入" % index, True
+                # 直接给 snapshot 也不能绕过规则：解码后按同一套 App 规则逐段校验
+                snapshot_problems = validate_custom_workout_snapshot(
+                    snapshot, "workouts[%d]" % index)
+                if snapshot_problems:
+                    return rule_failure(snapshot_problems), True
                 wid = item.get("id")
                 if wid in (None, 0):
                     # 新建时允许不传 id：桥端分配一个不会与手机本地 id 冲突的正整数
@@ -2067,6 +3499,19 @@ def mcp_main(store):
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "intervalrunning-bridge", "version": "1.0.0"},
+                # 规则必须随握手一次性给到模型：只写在工具描述里时，模型经常只挑
+                # 「写一个四周计划」这类通用做法，把训练细节塞进 workoutName，
+                # 到写入时才被拒绝。这里前置约束，把「先看规则再生成」变成默认行为。
+                "instructions": (
+                    "本服务把手机上的跑步课表与训练计划暴露给智能体，写入会用 App 的课表规则强校验。\n"
+                    + APP_PLAN_WORKFLOW_TEXT + "\n"
+                    + APP_STEP_RULES_TEXT +
+                    "\n推荐调用顺序：list_sessions（看历史）→ list_workouts（看可用课表）→ "
+                    "validate_plan（自检）→ set_plan（提交）→ wait_for_plan_result（等待手机验收）。"
+                    "工具返回 RULE_VIOLATION 或 REJECTED 时不要向用户解释规则，"
+                    "直接按 problems 修正并重新走完整链路；返回 PENDING/TIMEOUT 时不得判定完成，"
+                    "用 get_plan_status 继续查询。"
+                ),
             })
         elif method in ("notifications/initialized", "initialized"):
             continue
@@ -2272,7 +3717,8 @@ def selftest(store_path):
         {"id": 1, "date": "2026-11-23", "hour": 7, "workoutName": "轻松跑",
          "steps": [{"type": "WARMUP", "durationSec": 300},
                    {"type": "WORK", "durationSec": 120,
-                    "target": {"type": "HR_RANGE", "minValue": 150, "maxValue": 170}}]},
+                    "target": {"type": "HR_RANGE", "percent": False,
+                               "minValue": 150, "maxValue": 170}}]},
         {"id": 2, "date": "2026-11-25", "workoutId": 5, "workoutName": "间歇"},
     ], tz=resolve_tz("Asia/Shanghai", 480))
     check("计划格式校验", not verify_plan_shape(plan, tz=resolve_tz("Asia/Shanghai", 480)),
@@ -2330,13 +3776,121 @@ def selftest(store_path):
             "steps": [{"type": "WORK", "durationSec": 600}],
         }],
     })
-    check("MCP set_plan", not is_err and "已写入计划" in text, text)
+    check("MCP set_plan 返回待验收",
+          not is_err and "PLAN_SUBMITTED" in text
+          and "PENDING_APP_ACCEPTANCE" in text
+          and '"completed": false' in text, text)
     check("智能体写新计划先归档旧计划",
-          "已归档旧计划" in text
+          '"archivedPlan": "' in text
           and len(store.snapshot()["plans"]["phone-a"]["archives"]) == archives_before_mcp + 1,
-          text[:160])
+          text[:200])
     check("智能体写计划升级版本",
           store.get_plan_revision("phone-a") == rev_before_mcp + 1)
+
+    # ---- 验收闭环：提交 → PENDING → 手机回执 → APPLIED/REJECTED ----
+    text, is_err = call_tool(store, "get_plan_status", {"clientId": "phone-a"})
+    check("提交后状态为 PENDING",
+          not is_err and '"status": "PENDING"' in text and '"completed": false' in text,
+          text[:200])
+    accepted_rev = store.get_plan_revision("phone-a")
+    store.record_plan_acceptance("phone-a", accepted_rev, "REJECTED", ["第 1 段快慢跑混用"])
+    text, is_err = call_tool(store, "get_plan_status", {"clientId": "phone-a"})
+    check("手机拒绝后状态为 REJECTED 且带明细",
+          not is_err and '"status": "REJECTED"' in text and "快慢跑混用" in text,
+          text[:220])
+    text, is_err = call_tool(store, "wait_for_plan_result",
+                             {"clientId": "phone-a", "timeoutSec": 1})
+    check("wait 立即返回已拒绝结果",
+          not is_err and '"status": "REJECTED"' in text and '"completed": false' in text,
+          text[:220])
+    store.record_plan_acceptance("phone-a", accepted_rev, "APPLIED", [], "已落库")
+    text, is_err = call_tool(store, "wait_for_plan_result",
+                             {"clientId": "phone-a", "timeoutSec": 2})
+    check("wait 收到 APPLIED 才判定完成",
+          not is_err and '"status": "APPLIED"' in text and '"completed": true' in text,
+          text[:220])
+
+    # 新提交必须把上一版的 APPLIED 重置为 PENDING，不能继承完成态
+    rev_before_resubmit = store.get_plan_revision("phone-a")
+    call_tool(store, "set_plan", {
+        "clientId": "phone-a", "name": "再次提交", "startDate": "2026-11-23", "weeks": 2,
+        "entries": [{"date": "2026-11-23", "workoutName": "Y",
+                     "steps": [{"type": "WORK", "durationSec": 60}]}],
+    })
+    text, is_err = call_tool(store, "get_plan_status", {"clientId": "phone-a"})
+    check("新提交重置为 PENDING，不继承上一版 APPLIED",
+          not is_err and '"status": "PENDING"' in text
+          and store.get_plan_revision("phone-a") == rev_before_resubmit + 1, text[:220])
+
+    # 等待超时：手机没回执时必须返回 PENDING，绝不能默认成功
+    text, is_err = call_tool(store, "wait_for_plan_result",
+                             {"clientId": "phone-a", "timeoutSec": 1})
+    check("等待超时返回 PENDING 且未完成",
+          not is_err and '"code": "PLAN_PENDING"' in text
+          and '"completed": false' in text and '"waitedSec": 1' in text, text[:240])
+
+    # 迟到回执不能把当前版本标成上一版的结果
+    current_rev = store.get_plan_revision("phone-a")
+    store.record_plan_acceptance("phone-a", current_rev - 1, "APPLIED", [], "迟到的通过")
+    check("迟到回执不覆盖当前版本",
+          store.get_plan_acceptance("phone-a").get("status") == "PENDING",
+          str(store.get_plan_acceptance("phone-a")))
+
+    # HTTP 验收回执：手机把 APP 端结果推回桥端
+    code, body = http("POST", "/v1/plan/result", {
+        "v": 1, "clientId": "phone-a", "revision": current_rev,
+        "status": "REJECTED", "problems": ["HTTP 回执测试"], "message": "手机拒绝",
+    }, token="tok-rw", permission="READ_WRITE")
+    acceptance = store.get_plan_acceptance("phone-a")
+    check("HTTP 验收回执被接收",
+          code == 200 and body.get("code") == "OK", str(body))
+    check("HTTP 回执写入当前版本",
+          acceptance.get("status") == "REJECTED"
+          and acceptance.get("problems") == ["HTTP 回执测试"], str(acceptance))
+    code, body = http("POST", "/v1/plan/result", {
+        "v": 1, "clientId": "phone-a", "revision": current_rev,
+        "status": "APPLIED",
+    }, token="tok-ro", permission="READ_ONLY")
+    check("只读档不能上报验收",
+          code == 403 and body.get("code") == "PERMISSION_DENIED", str(body))
+
+    # 手机回传自己计划时：待验收 -> PHONE_UPLOADED；已通过 -> 保留 APPLIED
+    upload_plan = build_plan("覆盖测试", "2026-11-23", 2, "", [
+        {"date": "2026-11-23", "workoutId": 5, "workoutName": "轻松跑"},
+    ], tz=resolve_tz("Asia/Shanghai", 480))
+    store.set_plan("phone-u", upload_plan)
+    store.phone_upload_plan("phone-u", upload_plan)
+    check("待验收时手机覆盖计划 -> PHONE_UPLOADED",
+          store.get_plan_acceptance("phone-u").get("status") == "PHONE_UPLOADED",
+          str(store.get_plan_acceptance("phone-u")))
+    store.set_plan("phone-u", upload_plan)
+    uid = store.get_plan_revision("phone-u")
+    store.record_plan_acceptance("phone-u", uid, "APPLIED", [], "已落库")
+    store.phone_upload_plan("phone-u", upload_plan)
+    check("已通过的验收不会被手机回传抹掉",
+          store.get_plan_acceptance("phone-u").get("status") == "APPLIED",
+          str(store.get_plan_acceptance("phone-u")))
+
+    # 自检：只校验，不写库
+    rev_before_check = store.get_plan_revision("phone-a")
+    text, is_err = call_tool(store, "validate_plan", {
+        "clientId": "phone-a", "name": "自检通过", "startDate": "2026-11-23", "weeks": 2,
+        "entries": [{"date": "2026-11-23", "workoutName": "轻松跑",
+                     "steps": [{"type": "WARMUP", "durationSec": 300},
+                               {"type": "WORK", "durationSec": 600}]}],
+    })
+    check("自检通过且不写库",
+          not is_err and "SELF_CHECK_PASSED" in text
+          and store.get_plan_revision("phone-a") == rev_before_check, text[:200])
+    text, is_err = call_tool(store, "validate_plan", {
+        "clientId": "phone-a", "name": "自检失败", "startDate": "2026-11-23", "weeks": 2,
+        "entries": [{"date": "2026-11-23", "workoutName": "混搭",
+                     "steps": [{"type": "WORK", "distanceM": 1000},
+                               {"type": "RECOVERY", "durationSec": 60}]}],
+    })
+    check("自检失败返回明细且不写库",
+          not is_err and "SELF_CHECK_FAILED" in text and "混用了两种计量方式" in text
+          and store.get_plan_revision("phone-a") == rev_before_check, text[:240])
 
     # 智能体写「另一台设备」不能改变当前活跃设备，否则后续省略 clientId 会写错槽位
     active_before = store.active_client_id()
@@ -2349,7 +3903,7 @@ def selftest(store_path):
           store.active_client_id())
 
     text, is_err = call_tool(store, "get_plan", {"clientId": "phone-a"})
-    check("MCP get_plan", not is_err and "MCP 计划" in text)
+    check("MCP get_plan", not is_err and '"entries"' in text, text[:120])
     text, is_err = call_tool(store, "set_plan", {"name": "坏", "startDate": "2026-11-23",
                                                   "weeks": 99, "entries": []})
     check("MCP set_plan 校验", is_err)
@@ -2377,10 +3931,11 @@ def selftest(store_path):
     text, is_err = call_tool(store, "set_plan_json", {"plan": raw_steps_plan, "clientId": "phone-a"})
     written = store.get_plan("phone-a")
     check("set_plan_json 自动补 customWorkout",
-          not is_err and "已自动编码" in text
-          and bool(written["entries"][0].get("customWorkout")), text[:180])
+          not is_err and '"autoEncodedEntries": 1' in text
+          and "PENDING_APP_ACCEPTANCE" in text
+          and bool(written["entries"][0].get("customWorkout")), text[:220])
     check("补齐后 App 可解析", app_parseable_count(written) == 1)
-    check("回执包含可解析条数", "App 可解析 1 条" in text, text[:180])
+    check("回执包含可解析条数", '"parseableEntries": 1' in text, text[:220])
 
     # 越界值与超周期条目必须被拒（App 侧只会夹紧，静默改写不是我们要的）
     tz_sh = resolve_tz("Asia/Shanghai", 480)
@@ -2401,6 +3956,182 @@ def selftest(store_path):
           str(verify_plan_shape(beyond, tz=tz_sh)))
     empty_plan = {"name": "空", "startDate": date_ms("2026-11-23", tz_sh), "weeks": 2, "entries": []}
     check("空计划被拒", any("entries 为空" in p for p in verify_plan_shape(empty_plan, tz=tz_sh)))
+
+    # ---- App 训练段规则闸门（智能体输出必须 100% 合规） ----
+    _norm, rule_problems, _notes = normalize_workout_steps([
+        {"type": "WORK", "distanceM": 1000},
+        {"type": "RECOVERY", "durationSec": 60},
+    ], "混合计量")
+    check("规则-快慢跑混用计量被拦",
+          any("混用了两种计量方式" in p for p in rule_problems), str(rule_problems))
+
+    _norm, rule_problems, _notes = normalize_workout_steps([
+        {"type": "WORK", "durationSec": 240, "distanceM": 800},
+    ], "两种量")
+    check("规则-同时给时长与距离被拦",
+          any("只能二选一" in p for p in rule_problems), str(rule_problems))
+
+    _norm, rule_problems, _notes = normalize_workout_steps([
+        {"type": "WARMUP", "distanceM": 1000,
+         "target": {"type": "HR_RANGE", "percent": True, "minValue": 50, "maxValue": 60}},
+    ], "热身")
+    check("规则-热身距离与目标被拦",
+          any("热身：只能按时间" in p for p in rule_problems)
+          and any("热身：不能设置目标区间" in p for p in rule_problems), str(rule_problems))
+
+    _norm, rule_problems, _notes = normalize_workout_steps([
+        {"type": "WORK", "durationSec": 240,
+         "target": {"type": "HR_RANGE", "minValue": 150, "maxValue": 170}},
+    ], "心率")
+    check("规则-心率目标缺 percent 被拦",
+          any("必须显式给 target.percent" in p for p in rule_problems), str(rule_problems))
+
+    _norm, rule_problems, rule_notes = normalize_workout_steps([
+        {"type": "WORK", "durationSec": 60, "repeatCount": 5},
+    ], "单段重复")
+    check("映射-单段 repeatCount 自动补循环组",
+          not rule_problems and _norm[0].get("repeatGroupId") == 1 and bool(rule_notes),
+          str(rule_notes))
+
+    _norm, rule_problems, _notes = normalize_workout_steps([
+        {"type": "WORK", "distanceM": 1000,
+         "target": {"type": "PACE_RANGE", "minValue": "4:30", "maxValue": "4:40"}},
+    ], "配速")
+    check("映射-配速 4:30 读成秒/公里",
+          not rule_problems and _norm[0]["target"]["minValue"] == 270.0, str(rule_problems))
+
+    set_plan_desc = next(t["description"] for t in tool_defs() if t["name"] == "set_plan")
+    check("prompt-工具描述前置 App 规则",
+          "App 课表硬规则" in set_plan_desc and "不允许混用" in set_plan_desc)
+
+    # ---- 文本参数一致性：量化标准必须落到结构化字段 ----
+    def _text_check(title, steps, name="训练", desc=""):
+        normalized, probs, _ = normalize_workout_steps(steps, title)
+        return probs + validate_workout_text(name, desc, normalized, title)
+
+    _p = _text_check("文本-OPEN配速", [
+        {"type": "WORK", "durationSec": 240, "label": "配速4'30\""}])
+    check("规则-OPEN 目标禁止文本配速",
+          any("目标类型是 OPEN" in item for item in _p), str(_p))
+
+    _p = _text_check("文本-心率配速混写", [
+        {"type": "WORK", "durationSec": 240, "label": "心率160，配速4'30\"",
+         "target": {"type": "HR_RANGE", "percent": False,
+                    "minValue": 160, "maxValue": 170}}])
+    check("规则-心率目标禁止文本配速",
+          any("目标是心率" in item for item in _p), str(_p))
+
+    _p = _text_check("文本-距离落到字段", [
+        {"type": "WORK", "distanceM": 1000, "label": "阈值1000m"}])
+    check("规则-距离与 distanceM 一致", not _p, str(_p))
+
+    _p = _text_check("文本-距离只在名称", [
+        {"type": "WORK", "durationSec": 240, "label": "阈值1000m"}])
+    check("规则-时间步禁止文本距离",
+          any("按时间计量" in item for item in _p), str(_p))
+
+    _p = _text_check("文本-步频只在名称", [
+        {"type": "WORK", "durationSec": 240, "label": "步频180",
+         "target": {"type": "HR_RANGE", "percent": False,
+                    "minValue": 150, "maxValue": 160}}])
+    check("规则-步频必须配置 cadenceSpm",
+          any("没有配置 cadenceSpm" in item for item in _p), str(_p))
+
+    _p = _text_check("文本-标题心率一致", [
+        {"type": "WORK", "durationSec": 240,
+         "target": {"type": "HR_RANGE", "percent": False,
+                    "minValue": 160, "maxValue": 170}}],
+        name="心率160-170 阈值跑")
+    check("规则-标题心率与目标一致", not _p, str(_p))
+
+    _p = _text_check("文本-标题心率无目标", [
+        {"type": "WORK", "durationSec": 240}], name="心率160-170 阈值跑")
+    check("规则-标题心率必须有对应目标",
+          any("标题/描述写了心率" in item for item in _p), str(_p))
+
+    _p = _text_check("文本-结构名不误判", [
+        {"type": "WARMUP", "durationSec": 600},
+        {"type": "WORK", "durationSec": 240, "repeatGroupId": 1, "repeatCount": 4},
+        {"type": "RECOVERY", "durationSec": 180, "repeatGroupId": 1, "repeatCount": 4}],
+        name="挪威 4×4")
+    check("规则-结构名不误判为标准", not _p, str(_p))
+
+    plan_text = {"name": "配速4'30\" 阈值计划", "startDate": 1, "weeks": 2,
+                 "entries": [{"id": 1, "date": 1,
+                              "customWorkout": encode_workout_snapshot("阈值跑", [
+                                  {"type": "WORK", "durationSec": 240,
+                                   "target": {"type": "HR_RANGE", "percent": False,
+                                              "minValue": 160, "maxValue": 170}}])}]}
+    plan_text_problems = validate_plan_rules(plan_text)
+    check("规则-计划标题配速必须有结构化目标",
+          any("计划名称/备注写了配速" in item for item in plan_text_problems),
+          str(plan_text_problems))
+
+    # 全参数结构化样例：配速、心率、步频、恢复门槛都必须落到字段并可通过自检
+    structured_args = {
+        "clientId": "phone-a", "name": "结构化参数验证",
+        "startDate": "2026-11-23", "weeks": 2,
+        "entries": [{
+            "date": "2026-11-24", "workoutName": "阈值 1000m",
+            "steps": [
+                {"type": "WARMUP", "durationSec": 600},
+                {"type": "WORK", "distanceM": 1000, "repeatGroupId": 1, "repeatCount": 4,
+                 "cadenceSpm": 180,
+                 "target": {"type": "PACE_RANGE", "minValue": "4:30", "maxValue": "4:40"}},
+                {"type": "RECOVERY", "distanceM": 200, "repeatGroupId": 1, "repeatCount": 4,
+                 "hrGatePercent": 70,
+                 "target": {"type": "HR_RANGE", "percent": True,
+                            "minValue": 60, "maxValue": 70}},
+                {"type": "COOLDOWN", "durationSec": 300},
+            ],
+        }],
+    }
+    text, is_err = call_tool(store, "validate_plan", structured_args)
+    check("自检-全参数结构化计划通过",
+          not is_err and "SELF_CHECK_PASSED" in text, text[:240])
+    encoded = encode_workout_snapshot(
+        "阈值 1000m", structured_args["entries"][0]["steps"])
+    encoded_steps = json.loads(encoded)["workout"]["steps"]
+    check("编码-配速/心率/步频/恢复门槛全部落到字段",
+          encoded_steps[1]["target"]["type"] == "PACE_RANGE"
+          and encoded_steps[1]["cadenceSpm"] == 180
+          and encoded_steps[2]["target"]["type"] == "HR_RANGE"
+          and encoded_steps[2]["target"]["percent"] is True
+          and encoded_steps[2]["hrGatePercent"] == 70,
+          encoded[:400])
+
+    # 违规写入必须整份拦截，且桥端版本不变（客户端不会拉到坏计划）
+    rev_before_rule = store.get_plan_revision("phone-a")
+    text, is_err = call_tool(store, "set_plan", {
+        "clientId": "phone-a", "name": "违规计划", "startDate": "2026-11-23", "weeks": 2,
+        "entries": [{"date": "2026-11-23", "workoutName": "混搭",
+                     "steps": [{"type": "WORK", "distanceM": 1000},
+                               {"type": "RECOVERY", "durationSec": 60}]}],
+    })
+    check("set_plan 违规被拦截且未写入",
+          is_err and "RULE_VIOLATION" in text and "REGENERATE" in text
+          and store.get_plan_revision("phone-a") == rev_before_rule, text[:200])
+
+    # 直接塞 customWorkout 快照也不能绕过规则
+    bad_snapshot = json.loads(
+        encode_workout_snapshot("合法占位", [{"type": "WORK", "durationSec": 60}]))
+    bad_snapshot["workout"]["steps"].append({"type": "RECOVERY", "distanceM": 200})
+    bad_snapshot_text = json.dumps(bad_snapshot, ensure_ascii=False)
+    text, is_err = call_tool(store, "set_plan_json", {
+        "clientId": "phone-a",
+        "plan": {"name": "快照绕过", "startDate": date_ms("2026-11-23", tz_sh), "weeks": 2,
+                 "entries": [{"id": 1, "date": date_ms("2026-11-23", tz_sh), "workoutId": 0,
+                              "customWorkout": bad_snapshot_text}]},
+    })
+    check("set_plan_json 违规快照被拦截",
+          is_err and "RULE_VIOLATION" in text, text[:200])
+
+    text, is_err = call_tool(store, "set_workouts", {
+        "clientId": "phone-a",
+        "workouts": [{"name": "混搭课表", "snapshot": bad_snapshot_text}],
+    })
+    check("set_workouts 违规快照被拦截",
+          is_err and "RULE_VIOLATION" in text, text[:200])
 
     # 时区口径：同一个日历日在手机时区与桥端时区必须落在同一时刻
     tz_sh = resolve_tz("Asia/Shanghai", 480)
@@ -2474,12 +4205,12 @@ def selftest(store_path):
     check("智能体写预设被拒绝", is_err and "预设只读" in text, text[:160])
 
     # 空步骤课表会把手机用户课表清成 0 段，必须在桥端就拒绝
+    empty_snapshot = json.dumps({"workout": {"name": "空课表", "steps": []}}, ensure_ascii=False)
     text, is_err = call_tool(store, "set_workouts", {
         "clientId": ro_client,
-        "workouts": [{"id": 14, "name": "空课表",
-                      "snapshot": encode_workout_snapshot("空课表", [])}],
+        "workouts": [{"id": 14, "name": "空课表", "snapshot": empty_snapshot}],
     })
-    check("智能体写空课表被拒绝", is_err and "没有步骤" in text, text[:160])
+    check("智能体写空课表被拒绝", is_err and "没有任何步骤" in text, text[:160])
 
     # 步骤名 7 字上限 + 步频透传：接口写入时就要按 App 规则收口，不能等打开编辑器才截
     text, is_err = call_tool(store, "set_plan", {
